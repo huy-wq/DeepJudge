@@ -1,0 +1,52 @@
+# ---------- secrets ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------- python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# ---------- node ----------
+node_modules/
+dist/
+dist-ssr/
+.pnpm-store/
+*.local
+
+# ---------- data & artifacts ----------
+# 学生答卷、评分结果等属于敏感数据，一律不入库
+data/*
+!data/.gitkeep
+!data/samples/
+!data/samples/**
+outputs/
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# ---------- models / cache ----------
+models/
+.cache/
+*.safetensors
+*.gguf
+*.bin
+
+# ---------- editor / os ----------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
