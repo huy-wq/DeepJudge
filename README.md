@@ -21,7 +21,8 @@
 > 把"让模型给一个总分"改造成"**让模型逐条判定采分点是否命中，并为每条判定提供原文证据**"，
 > 再用多次采样的一致性作为置信度，对低置信结果路由人工复核，最后用人工标注样本做分数校准。
 
-详细设计见 [docs/architecture.md](docs/architecture.md)，实验与评测方案见 [docs/evaluation.md](docs/evaluation.md)。
+详细设计见 [docs/architecture.md](docs/architecture.md)，每个方法的出处与局限见
+[docs/solution-rationale.md](docs/solution-rationale.md)，验证方案见 [docs/evaluation.md](docs/evaluation.md)。
 
 ## 三、仓库结构
 
@@ -31,8 +32,10 @@ DeepJudge/
 ├── .env.example              # 环境变量模板（真实 .env 不入库）
 ├── .gitignore
 ├── docs/
-│   ├── architecture.md       # 核心技术方案：评分流水线、数据模型、工程要点
-│   └── evaluation.md         # 评测方案：数据集、指标、消融实验矩阵
+│   ├── architecture.md       # 核心技术方案：决策状态、评分流水线、数据模型
+│   ├── solution-rationale.md # 方案依据：每个方法解决什么问题、出处与局限
+│   ├── evaluation.md         # 系统验证：指标、对照组、测试产出
+│   └── tooling.md            # 本地工具配置（skill 安装记录）
 ├── backend/                  # 服务端：Python + FastAPI（评分引擎在此）
 ├── frontend/                 # 评卷与复核界面（选型待定）
 └── data/                     # 本地数据（答卷、标注集），默认不入库

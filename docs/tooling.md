@@ -2,13 +2,13 @@
 
 ## Matt Pocock skill 包
 
-| 项 | 值 |
-| --- | --- |
-| 来源 | https://github.com/mattpocock/skills |
-| 版本 | commit `5beb35b040e3de97e54fa9e386d7e42d15c295c2`（2026-10-19） |
-| 许可 | MIT |
-| 安装位置 | `.dsh/skills/`（本项目级，已被 `.gitignore` 忽略） |
-| 数量 | 38 个 skill，其中 15 个对模型可见，23 个仅用户主动调用 |
+| 项       | 值                                                              |
+| -------- | --------------------------------------------------------------- |
+| 来源     | <https://github.com/mattpocock/skills>                            |
+| 版本     | commit `5beb35b040e3de97e54fa9e386d7e42d15c295c2`（2026-10-19） |
+| 许可     | MIT                                                             |
+| 安装位置 | `.dsh/skills/`（本项目级，已被 `.gitignore` 忽略）              |
+| 数量     | 38 个 skill，其中 15 个对模型可见，23 个仅用户主动调用          |
 
 ### 为什么是拍平的目录结构
 
@@ -30,8 +30,8 @@ rm -rf /tmp/mp-skills
 git clone --depth 1 https://github.com/mattpocock/skills /tmp/mp-skills
 rm -rf .dsh/skills
 mkdir -p .dsh/skills
-for f in $(find /tmp/mp-skills/skills -name SKILL.md); do
   cp -r "$(dirname "$f")" ".dsh/skills/$(basename "$(dirname "$f")")"
+for f in $(find /tmp/mp-skills/skills -name SKILL.md); do
 done
 ```
 
