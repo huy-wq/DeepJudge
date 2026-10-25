@@ -44,6 +44,10 @@ models/
 *.gguf
 *.bin
 
+# ---------- local agent tooling ----------
+# 第三方 skill 包（mattpocock/skills），仅本机工具配置，不随课题仓库分发
+.dsh/
+
 # ---------- editor / os ----------
 .idea/
 .vscode/
