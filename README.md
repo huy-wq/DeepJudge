@@ -30,25 +30,35 @@ DeepJudge/
 ├── docs/
 │   ├── architecture.md       # 核心技术方案：评分流水线、数据模型、工程要点
 │   └── evaluation.md         # 评测方案：数据集、指标、消融实验矩阵
-├── backend/                  # 服务端（技术栈待定，见下）
-├── frontend/                 # 评卷与复核界面
+├── backend/                  # 服务端：Python + FastAPI（评分引擎在此）
+├── frontend/                 # 评卷与复核界面（选型待定）
 └── data/                     # 本地数据（答卷、标注集），默认不入库
 ```
 
 ## 四、技术栈
 
-> 状态：**待确认**。当前推荐 Python 生态，理由是 NLP/评测/统计（QWK、isotonic 校准、bootstrap）依赖成熟，
-> 且 DeepSeek SDK 与 openai 兼容。
+> 只锁定语言与框架，其余留缝。判断依据：评分流水线的正确性不取决于数据库、队列或某个模型。
 
-- 后端：FastAPI + SQLAlchemy + SQLite（开发）/ PostgreSQL（部署）
-- 异步任务：Redis + RQ / Celery（评分是长任务，必须异步 + 可重试）
-- 前端：Vue 3 + Element Plus（评卷台、复核台、统计看板）
-- 模型：DeepSeek API，`deepseek-flash` 为主，`deepseek-v4-pro` 用于对照实验
-- 部署：Docker Compose + Nginx
+| 层 | 选型 | 状态 |
+| --- | --- | --- |
+| 语言 / 运行时 | Python 3.10+ | **已定** |
+| Web 框架 | FastAPI | **已定** |
+| 服务形态 | 单体后端 | **已定** |
+| 数据库 | 开发期 SQLite，后续可迁移 | 待定 |
+| 任务执行 | 进程内后台任务 / 独立 worker | 待定 |
+| 前端 | 未定 | 待定 |
+| LLM 供应商与模型参数 | — | **待你补充** |
+| 部署 | 本地优先 | 待定 |
 
-## 五、模型与 API 现状（2026-10 核实）
+评分引擎只依赖 `GradingProvider` 一个接口（见 [docs/architecture.md](docs/architecture.md) 第 3.4 节），
+换模型、换供应商都不影响流水线，也不影响已有测试。
 
-| 项 | 值 |
+## 五、LLM API（待补充）
+
+具体供应商、模型与参数由你后续确定。下表是 2026-10 核实的 DeepSeek API 现状，**仅作参考**，
+最终以接入时的官方文档为准：
+
+| 项 | 值（参考） |
 | --- | --- |
 | 模型 | `deepseek-flash`（V4.1-Flash-1017）、`deepseek-v4-pro`（V4-Pro-0813） |
 | 上下文 / 输出 | 1M / 最大 384K |
@@ -57,23 +67,24 @@ DeepJudge/
 | 工具调用 | 支持（可做函数式评分骨架） |
 | 价格（flash） | 缓存命中输入 0.02~0.04 元/M，未命中 1~2 元/M，输出 4~8 元/M（空闲时段半价） |
 
-关键推论：**思考模式下无法用 temperature=0 换取确定性**，稳定性必须靠"多次采样 + 聚合 + 校准"来获得，
-这恰好构成本课题的实验变量之一。同时 rubric 等稳定前缀可利用上下文硬盘缓存，输入成本可降一个数量级。
+关键推论：部分思考型模型会忽略 `temperature`，无法用采样参数换取确定性——稳定性只能靠"多次采样 + 聚合 + 校准"获得，
+这恰好构成本课题的实验变量之一。若接入的 API 支持上下文缓存，稳定的 rubric 前缀还能进一步压低输入成本。
 
 ## 六、快速开始
 
 ```bash
 git clone <your-remote-url> DeepJudge && cd DeepJudge
-cp .env.example .env          # 填入 DEEPSEEK_API_KEY
 python3 -m venv .venv && source .venv/bin/activate
-# 依赖与服务启动命令待技术栈确认后补充
+cp .env.example .env          # LLM API key，变量名待供应商确定后调整
+# 依赖安装与服务启动在工程骨架落地后补充，预期形态：
+# cd backend && pip install -e ".[dev]" && uvicorn app.main:app --reload
 ```
 
 ## 七、进度
 
-- [x] 仓库初始化、方案与评测设计文档
-- [ ] 技术栈确认与工程骨架
-- [ ] 评分引擎 MVP（单题、单评分标准、结构化输出）
+- [x] 仓库初始化、课题定位与评测设计文档
+- [x] 技术栈锁定：Python + FastAPI（数据库 / 队列 / 前端 / LLM API 仍待定）
+- [ ] 工程骨架与评分引擎 MVP（单题、单评分标准、结构化输出）
 - [ ] 标注数据集与基线实验
 - [ ] 校准、人机协同与复核界面
 - [ ] 消融实验与论文撰写
