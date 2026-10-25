@@ -2,8 +2,8 @@
 
 本仓库的 issue 与 spec 以 GitHub issue 的形式存在。所有操作统一通过 `gh` CLI 完成。
 
-> **前置条件**：远程仓库已就绪（`origin` = `git@github.com:huy-wq/DeepJudge.git`），但本机尚未安装 `gh`。
-> 装好并登录 `gh` 之前，`to-spec`、`to-tickets`、`triage` 无法真正发布或读取 issue。
+> **前置条件已满足**：远程仓库已配置（`git@github.com:huy-wq/DeepJudge.git`），
+> `gh` 2.103.2 已安装并以 `huy-wq` 登录，五个分诊标签已创建。以下命令可直接执行。
 
 ## 约定
 
