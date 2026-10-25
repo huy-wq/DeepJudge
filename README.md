@@ -79,7 +79,7 @@ DeepJudge/
 ## 六、快速开始
 
 ```bash
-git clone <your-remote-url> DeepJudge && cd DeepJudge
+git clone git@github.com:huy-wq/DeepJudge.git && cd DeepJudge
 python3 -m venv .venv && source .venv/bin/activate
 cp .env.example .env          # LLM API key，变量名待供应商确定后调整
 # 依赖安装与服务启动在工程骨架落地后补充，预期形态：
