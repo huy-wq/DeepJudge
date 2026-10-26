@@ -35,6 +35,7 @@ DeepJudge/
 │   ├── architecture.md       # 核心技术方案：决策状态、评分流水线、数据模型
 │   ├── solution-rationale.md # 方案依据：每个方法解决什么问题、出处与局限
 │   ├── evaluation.md         # 系统验证：指标、对照组、测试产出
+│   ├── reference-llmgrader.md # 开源参考项目拆解：可借鉴的设计与它的空白
 │   └── tooling.md            # 本地工具配置（skill 安装记录）
 ├── backend/                  # 服务端：Python + FastAPI（评分引擎在此）
 ├── frontend/                 # 评卷与复核界面（选型待定）
