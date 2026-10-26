@@ -21,18 +21,28 @@ def build_report(result) -> dict:
         "question_id": result.question_id,
         "score": result.score,
         "max_score": result.max_score,
+        "grounding_rate": round(result.grounding_rate(), 4),
+        "ungrounded": result.ungrounded_ids(),
         "items": [
             {
                 "id": ij.item_id,
                 "level": ij.level,
                 "hit": ij.hit,
+                "grounded": ij.grounded,
                 "evidence": ij.evidence,
+                "span": list(ij.span) if ij.span else None,
                 "reason": ij.reason,
             }
             for ij in result.items
         ],
         "deductions": [
-            {"id": dj.id, "hit": dj.hit, "evidence": dj.evidence}
+            {
+                "id": dj.id,
+                "hit": dj.hit,
+                "grounded": dj.grounded,
+                "evidence": dj.evidence,
+                "span": list(dj.span) if dj.span else None,
+            }
             for dj in result.deductions
         ],
         "comment": result.comment,

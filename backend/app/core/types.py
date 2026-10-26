@@ -11,6 +11,8 @@ from typing import Any
 
 EPS = 1e-9
 
+UNGROUNDED_NOTE = "证据未在答卷中定位，按未命中处理"
+
 
 @dataclass(frozen=True)
 class Level:
@@ -79,7 +81,20 @@ class ItemJudgement:
     level: float = 0.0
     hit: bool = False
     evidence: str = ""
+    span: tuple[int, int] | None = None
+    grounded: bool = False
     reason: str = ""
+
+    def mark_grounded(self, span: tuple[int, int]) -> None:
+        self.grounded = True
+        self.span = span
+
+    def mark_ungrounded(self) -> None:
+        """证据定位失败：保留模型的命中声称，但该点不再计分。"""
+        self.grounded = False
+        self.span = None
+        self.level = 0.0
+        self.reason = f"{self.reason}（{UNGROUNDED_NOTE}）" if self.reason else UNGROUNDED_NOTE
 
 
 @dataclass
@@ -87,7 +102,19 @@ class DeductionJudgement:
     id: str
     hit: bool = False
     evidence: str = ""
+    span: tuple[int, int] | None = None
+    grounded: bool = False
     reason: str = ""
+
+    def mark_grounded(self, span: tuple[int, int]) -> None:
+        self.grounded = True
+        self.span = span
+
+    def mark_ungrounded(self) -> None:
+        """证据定位失败：扣分项不生效。"""
+        self.grounded = False
+        self.span = None
+        self.reason = f"{self.reason}（{UNGROUNDED_NOTE}）" if self.reason else UNGROUNDED_NOTE
 
 
 @dataclass
@@ -103,3 +130,22 @@ class SampleJudgement:
 
     def levels(self) -> dict[str, float]:
         return {ij.item_id: ij.level for ij in self.items}
+
+    def grounding_rate(self) -> float:
+        """模型声称命中的判定里，有多少条证据真的定位到了。
+
+        分母只算声称命中的项：模型什么都没命中时，不存在"编造证据"，
+        不该把未命中项算成通过率的一部分。
+        """
+        checks = [ij.grounded for ij in self.items if ij.hit] + [
+            dj.grounded for dj in self.deductions if dj.hit
+        ]
+        if not checks:
+            return 1.0
+        return sum(1 for ok in checks if ok) / len(checks)
+
+    def ungrounded_ids(self) -> list[str]:
+        """未接地的判定 id，落库时作为 UNGROUNDED 标记呈现。"""
+        items = [ij.item_id for ij in self.items if ij.hit and not ij.grounded]
+        deductions = [dj.id for dj in self.deductions if dj.hit and not dj.grounded]
+        return items + deductions

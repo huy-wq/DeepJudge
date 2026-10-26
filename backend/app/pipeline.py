@@ -9,6 +9,7 @@ import json
 import re
 from typing import Any
 
+from .core.grounding import apply_grounding
 from .core.prompt import build_messages
 from .core.types import EPS, DeductionJudgement, ItemJudgement, Rubric, SampleJudgement
 from .providers.base import GradingProvider
@@ -110,9 +111,10 @@ def grade(
 
     items = _parse_items(rubric, payload)
     deductions = _parse_deductions(rubric, payload)
+    apply_grounding(items, deductions, answer)
 
     total = sum(rubric.item(ij.item_id).score_for(ij.level) for ij in items)
-    hit_ids = {dj.id for dj in deductions if dj.hit}
+    hit_ids = {dj.id for dj in deductions if dj.hit and dj.grounded}
     total += sum(d.effective() for d in rubric.deductions if d.id in hit_ids)
 
     return SampleJudgement(

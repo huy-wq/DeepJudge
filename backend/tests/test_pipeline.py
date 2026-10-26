@@ -101,7 +101,7 @@ class IgnoreModelArithmetic(unittest.TestCase):
 
     def test_deduction_reduces_score_and_never_goes_negative(self):
         data = json.loads(payload_text())
-        data["deductions"][0]["hit"] = True
+        data["deductions"][0].update(hit=True, evidence="客户端再发送 ACK=1")
         result = grade(self.rubric, ANSWER, CannedProvider([json.dumps(data, ensure_ascii=False)]))
         self.assertEqual(result.score, 6.0)
 
