@@ -9,8 +9,11 @@ import json
 import re
 from typing import Any
 
+from .core.aggregate import Aggregate, aggregate, sample_score
 from .core.grounding import apply_grounding
 from .core.prompt import build_messages
+from .core.routing import RouteDecision, RoutePolicy, decide
+from dataclasses import dataclass
 from .core.types import EPS, DeductionJudgement, ItemJudgement, Rubric, SampleJudgement
 from .providers.base import GradingProvider
 
@@ -113,15 +116,39 @@ def grade(
     deductions = _parse_deductions(rubric, payload)
     apply_grounding(items, deductions, answer)
 
-    total = sum(rubric.item(ij.item_id).score_for(ij.level) for ij in items)
-    hit_ids = {dj.id for dj in deductions if dj.hit and dj.grounded}
-    total += sum(d.effective() for d in rubric.deductions if d.id in hit_ids)
-
-    return SampleJudgement(
+    sample = SampleJudgement(
         question_id=rubric.question_id,
         items=items,
         deductions=deductions,
         comment=str(payload.get("comment", "") or ""),
-        score=round(max(0.0, min(rubric.total_score, total)), 2),
         max_score=rubric.total_score,
     )
+    sample.score = sample_score(rubric, sample)
+    return sample
+
+
+@dataclass
+class Evaluation:
+    samples: list[SampleJudgement]
+    aggregate: Aggregate
+    route: RouteDecision
+
+
+def evaluate(
+    rubric: Rubric,
+    answer: str,
+    provider: GradingProvider,
+    *,
+    samples: int = 3,
+    policy: RoutePolicy | None = None,
+) -> Evaluation:
+    """采样若干次后聚合，并给出自动通过 / 转人工的结论。"""
+    if samples < 1:
+        raise ValueError("采样次数至少为 1")
+
+    results = [
+        grade(rubric, answer, provider, sample_index=index) for index in range(samples)
+    ]
+    combined = aggregate(rubric, results)
+    decision = decide(combined, policy)
+    return Evaluation(samples=results, aggregate=combined, route=decision)

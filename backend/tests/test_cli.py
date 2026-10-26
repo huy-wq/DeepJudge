@@ -58,5 +58,42 @@ class CliRunsOneGrading(unittest.TestCase):
         self.assertEqual(out, "")
 
 
+
+
+class CliWithMultipleSamples(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        root = Path(self.dir.name)
+        self.rubric_path = root / "rubric.json"
+        self.answer_path = root / "answer.txt"
+        self.response_path = root / "model.json"
+        self.rubric_path.write_text(json.dumps(RUBRIC_DATA, ensure_ascii=False), encoding="utf-8")
+        self.answer_path.write_text(ANSWER, encoding="utf-8")
+        self.response_path.write_text(
+            json.dumps(SAMPLE_PAYLOAD, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_reports_aggregate_and_route(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = main([
+                "--rubric", str(self.rubric_path),
+                "--answer", str(self.answer_path),
+                "--response", str(self.response_path),
+                "--samples", "3",
+            ])
+
+        self.assertEqual(code, 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["samples"], 3)
+        self.assertEqual(len(report["items"][0]["levels"]), 3)
+        self.assertEqual(report["score"], 8.0)
+        self.assertEqual(report["confidence"], 1.0)
+        self.assertEqual(report["route"], "auto")
+
+
 if __name__ == "__main__":
     unittest.main()
