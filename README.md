@@ -31,6 +31,7 @@ DeepJudge/
 ├── AGENTS.md            # 项目约定（供 agent 读取）
 ├── docs/
 │   ├── architecture.md  # 唯一设计真源
+│   ├── codebase-guide.md # 代码库导读（按什么顺序读、每层看什么）
 │   ├── roadmap.md       # 功能实现清单（顺序与依赖）
 │   ├── ticket-notes.md  # 工单问题记录（遇到的坑与未决问题）
 │   ├── experiments.md   # 实验记录（真实调用的设置与结果）
