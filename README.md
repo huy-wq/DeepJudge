@@ -33,6 +33,7 @@ DeepJudge/
 │   ├── architecture.md  # 唯一设计真源
 │   ├── roadmap.md       # 功能实现清单（顺序与依赖）
 │   ├── ticket-notes.md  # 工单问题记录（遇到的坑与未决问题）
+│   ├── experiments.md   # 实验记录（真实调用的设置与结果）
 │   ├── agents/          # issue tracker / 标签 / 领域文档约定
 │   └── tooling.md       # 本地工具配置
 ├── backend/             # Python + FastAPI（目录待创建，结构见架构文档第 3 节）

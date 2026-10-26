@@ -136,7 +136,10 @@ class LiveModeWithoutKey(unittest.TestCase):
             (root / "answer.txt").write_text(ANSWER, encoding="utf-8")
 
             stdout, stderr = io.StringIO(), io.StringIO()
-            with mock.patch.dict(os.environ, {}, clear=False):
+            # 屏蔽真实 .env，确保这条用例只验证"没有密钥时的行为"，不联网。
+            with mock.patch("app.cli.load_project_env", lambda: None), mock.patch.dict(
+                os.environ, {}, clear=False
+            ):
                 os.environ.pop("DEEPSEEK_API_KEY", None)
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     code = main([
