@@ -11,7 +11,7 @@ from app.core.rubric import from_dict
 from app.pipeline import grade
 from app.providers.fake import CannedProvider
 from tests.fixtures import ANSWER, RUBRIC_DATA
-from tests.test_pipeline import SAMPLE_PAYLOAD
+from tests.fixtures import SAMPLE_PAYLOAD
 
 
 def payload_with(item_id: str, evidence: str, hit: bool = True) -> str:

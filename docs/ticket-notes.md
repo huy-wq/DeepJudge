@@ -159,3 +159,85 @@ python3 -m app.cli --rubric r.json --answer a.txt --live
 - `build_report` 负责挑选"代表采样"并组装展示字段，逻辑偏重；如果继续变复杂，应拆到独立的展示模块。
 - `risk` 公式是量纲混加的启发式，只在同批次内可比，没有理论依据。
 - `route` 用 `Literal["auto", "human"]` 约束，但仍缺统一的错误码/状态枚举。
+
+---
+
+## #5 持久化（2026-10-26）
+
+### 一、环境上的两件事（决定了这一票能验到什么程度）
+
+| 情况 | 现象 | 处理 |
+| --- | --- | --- |
+| PyPI 突然通了 | `#3` 时 `pypi.org` 不通，`#3`/`#4` 才全程标准库；这次 `pymysql`、`sqlalchemy`、`alembic` 都装上了 | 存储层用 SQLAlchemy 2.0 Core + Alembic + PyMySQL，与 `pyproject.toml` 早已声明的依赖一致 |
+| 本机没有 MySQL，也没有 sudo | `apt` 有 `mysql-server` 候选包，但装不了；镜像站的 MySQL 镜像反复在大层上 `EOF` | 单测跑内存 SQLite；MySQL 的字符集/方言验证写成**默认跳过**的真库用例，命令留在 README 与测试文件顶部 |
+
+**这一票的诚实结论：MySQL 的建表 DDL 已经离线渲染并逐条看过（`CHARSET=utf8mb4`、`LONGTEXT`、`DOUBLE`、`JSON` 都在），
+但"中文与 emoji 真能存进 MySQL"这一条，本机没有跑成。** 需要你在能起库的机器上跑一次
+`tests.test_store_mysql` 才算真正闭环。
+
+### 二、审查发现的缺陷
+
+| 问题 | 现象与原因 | 处理 | 教训 |
+| --- | --- | --- | --- |
+| 浮点会变成 `Decimal` | MySQL 的 `DOUBLE` 默认 `asdecimal=True`，查询回来是 `Decimal('8.0')`，与领域对象的 `float` 不相等 | 统一 `mysql.DOUBLE(asdecimal=False)`，并在迁移里显式写死 | "字段无损"不是"列都在"，而是"读回来的 Python 对象相等"；类型漂移是最隐蔽的丢数据 |
+| 同一个字段存两处版本号 | 原表设计里 `grading_runs.rubric_version` 与 `rubrics.version` 各存一份 | 改成 `rubric_id` 外键指向不可变快照，版本号 join 出来 | 两处冗余必然漂移；能用一个外键表达的，不要用两个整数表达 |
+| 扣分项硬塞进采分点的列 | `item_results` 原本只有 `rubric_item_id` 与 `level`，而扣分项没有等级 | 加 `kind`（`item`/`deduction`），`level` 允许为 `NULL` | 用一个字段装两种含义，迟早会造出"扣分项等级 0"这种假数据 |
+| 迁移与模型会悄悄漂移 | `tables.py` 是代码真源、`migrations/` 是部署真源，两边都能改 | 加测试真的跑 `upgrade head` / `downgrade base`，再把表、列、可空性、索引、唯一约束、外键逐项对照 | "测试库建得起来"不等于"生产库建得起来"；两个真源之间必须有机器强制对齐 |
+| 迁移里的默认值带了 SQLite 方言 | autogenerate 反射出 `sa.text('(CURRENT_TIMESTAMP)')`，是 SQLite 的写法 | 手工校正为 `CURRENT_TIMESTAMP`，并在迁移里写注释说明为何改 | 自动生成的迁移一定要读一遍；生成器的输入是什么方言，输出就带什么方言的痕迹 |
+
+### 三、有意保留的判断（不是缺陷）
+
+| 争议点 | 说明 |
+| --- | --- |
+| 写入是一个大事务 | 标准快照、答卷、N 次运行、逐条判定、聚合结果全进或全不进。半份数据比没有数据更危险——复核的人会以为那就是当时的结论 |
+| `questions` 复用而不更新 | 题干改了不覆盖旧行，靠 rubric 版本表达变化。题目本身的内容变更不在本课题范围内 |
+| 标准按 `checksum` 去重 | 内容相同就复用最新一版快照，避免每次评分都堆一版；内容变（含回滚到旧内容）就追加新版本，版本号始终单调 |
+| `--save` 不负责建表 | CLI 只写入，建表只能走 `alembic upgrade head`。让程序自动 `create_all` 会掩盖"生产库少了迁移"这类事故 |
+| 真库用例默认跳过 | 没有 `DEEPJUDGE_TEST_MYSQL_URL` 就 skip，而不是失败。默认套件必须能在没数据库的机器上一条命令跑完 |
+
+### 四、规范审查抓出来的问题
+
+| 问题 | 现象与原因 | 处理 | 教训 |
+| --- | --- | --- | --- |
+| 迁移与模型不一致 | 注释写着"浮点显式 `asdecimal=False`"，生成的列却是 `mysql.DOUBLE()` | 迁移里显式写 `mysql.DOUBLE(asdecimal=False)` | 自动生成的迁移里，注释和代码不是一件事；改了模型要回头核对生成物 |
+| 存储层反向依赖编排层 | `store/repository.py` import 了 `pipeline.Evaluation`，而 §3 的依赖表只允许它依赖 core、providers | 依赖表补上这一条并说明理由（`Evaluation` 就是"一次评分的产出"这个类型） | 文档写"允许依赖"时，要想到读取方需要的返回类型；与其让代码委屈，不如把规则写准 |
+| 迁移脚本绕过公开出口 | `migrations/env.py` 直接 import `app.store.tables`，与 `__init__.py` 里"不要直接 import tables"自相矛盾 | `app.store` 显式导出 `metadata`，env.py 走公开出口 | 自己定的边界自己先破，别人就没有理由遵守 |
+| 每条运行都重查一次标准 | `_load_sample` 内部再查 rubric、再 `from_dict`，与 `load_evaluation` 重复 | 由调用方把 rubric 传下去 | 一个查询在外层已经做过，就别在内层再写一遍；"字段无损"的代价不该是 N 倍查询 |
+| NULL 被静默补成 0 | `level ... else 0.0`、`score ... else 0.0` | 遇到 NULL 直接报错 | 这正是 §4.4 里"NULL 是没校准，不是校准为 0"的同一条原则：**补 0 是最难发现的造假** |
+| `psql` 子命令跑的是 mysql 客户端 | 复制粘贴留下的名字 | 改名 `shell` | 工具的名字写错，比工具本身不好用更误导人 |
+| `create_schema()` 与"建表只走迁移"并存 | 测试需要快速建表，但它和迁移并列成公开 API | 保留并在 docstring 里写明"只给单测与本地一次性脚本"，生产与 CI 走 alembic | 便利方法和正式流程并存时，必须把边界写在调用者看得到的地方 |
+
+### 五、需求审查抓出来的问题
+
+| 问题 | 现象与原因 | 处理 | 教训 |
+| --- | --- | --- | --- |
+| 运行元信息写而不读 | `model` / `params` / `tokens` / `latency` / `error` 存进了 `grading_runs`，但 `load_evaluation` 只返回领域对象，这些列永远读不回来 | 加 `RunRecord`，`StoredEvaluation` 同时带答卷元信息（脱敏号、truncated、规范化文本）与每次运行的元信息 | "字段无损"要按**每一列**验，不是"领域对象相等"就算完；审计要用的字段恰恰都不在领域对象里 |
+| 在线模式下 `model` 存成空串 | `--save` 从 `DEEPSEEK_MODEL` 环境变量取型号，没设就是空 | 由调用方把 provider 的实际型号传进来；离线模式没有型号可记，就记空串而不是编一个 | "没有值"和"值是空串"必须分开处理，默认值不能替用户瞎猜 |
+| 按运行号读回会串到别的评分 | 原来取该答卷最新的一条聚合，哪怕这条运行不在里面（重评过一次就会发生） | 按运行号读回时取**包含这条运行**的那次聚合；找不到返回 `None` | 用代理键读回时，必须校验"这次查询的对象真的属于那一次评分" |
+| MySQL 用例会清空开发库 | teardown 对用户给的库直接 `downgrade base` | 每次新建 `deepjudge_test_<随机>` 库、跑完 `DROP DATABASE`；没权限就 skip 并说明原因 | 测试的破坏半径要能一眼算清；"记得别在生产上跑"不是安全措施 |
+| emoji 只验了答卷与证据 | 标准快照走的是 JSON 列，字符集问题的表现与 TEXT 不同 | 标准题干、采分点描述也掺 emoji，并断言整个快照读回后相等；另加一条"所有文本列都是 utf8mb4"的断言 | 同一个风险在不同列类型上要各验一次，一类列通过不代表另一类也通过 |
+| `Store.create_schema()` 绕过迁移 | 公开 API 里同时存在"建表走迁移"和"直接建表"两条路 | 从 `Store` 移除，测试改用 `tests/support.py` 直接拿 `metadata` 建表 | 便利方法放在公开 API 上，等于给"跳过流程"发了一张许可证 |
+
+**有意保留的"越界"（需求没写，但我认为必要）**
+
+| 项 | 理由 |
+| --- | --- |
+| `data/samples/` 合成演示用例 | 验收要求"本地能一键建库并升级表结构"，README 的演示命令必须指向真实存在的文件；这些都是合成数据，不含任何学生信息 |
+| CLI `--save` / `--pseudo-id` | `answers.student_pseudo_id` 是 NOT NULL，没有写入口就只能全填 `anon`；`--save` 是"落库"这一验收在命令行上的唯一入口 |
+| `docker-compose.yml` 与 `scripts/dev-db.sh` | "一键建库"在字面上就包含起库这一步；只给迁移命令不算一键 |
+
+### 六、遗留
+
+- **MySQL 真库未验证**（见第一节）。补齐方式：`./scripts/dev-db.sh up` 后跑 `tests.test_store_mysql`。
+- 镜像拉取失败是环境问题，不是代码问题；`docker-compose.yml` 支持 `MYSQL_IMAGE` 覆盖，换镜像站即可。
+- `docker-compose.yml` 的 healthcheck 与 `scripts/dev-db.sh` 的等待循环**同样没有在真库上跑过**：
+  compose 文件能过 `docker compose config` 校验，但 `mysqladmin ping` 的实际退出码没法凭空确认。
+  第一次起库时若卡在“等待健康检查”，先看 `docker compose logs mysql` 与 `docker inspect` 的健康日志。
+- `answers.normalized_text` 会随结果一起读回，但目前没有消费方：证据偏移是原文偏移，规范化文本留给后续检索。
+- `tokens_in` / `tokens_out` / `latency_ms` 恒为 `NULL`：`DeepSeekProvider` 还没有解析响应的 `usage` 与计时。
+  宁可留空也不填估计值——审计字段填了假数，比空着更糟（见 `#7` 之后再补）。
+
+### 七、未决
+
+- `reviews` 与 `calibration_models` 两张表已建但无人写入，等 `#9 复核` 与校准上线再落地。
+- `span` 存的是原文偏移，但答卷若被截断，偏移会失效；截断策略本身还没实现（架构 §7 只写了要记录 `truncated`）。

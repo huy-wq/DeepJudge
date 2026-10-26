@@ -1,0 +1,33 @@
+{
+  "items": [
+    {
+      "id": "P1",
+      "hit": true,
+      "level": 1.0,
+      "evidence": "客户端首先发送 SYN 报文，seq=x",
+      "reason": "SYN 与序号均正确"
+    },
+    {
+      "id": "P2",
+      "hit": true,
+      "level": 0.5,
+      "evidence": "服务器回复 SYN=1、ACK=1，seq=y，ack=x+1",
+      "reason": "字段完整但未说明同意接收"
+    },
+    {
+      "id": "P3",
+      "hit": true,
+      "level": 1.0,
+      "evidence": "客户端再发送 ACK=1，seq=x+1，ack=y+1",
+      "reason": "确认关系正确"
+    }
+  ],
+  "deductions": [
+    {
+      "id": "D1",
+      "hit": false,
+      "evidence": ""
+    }
+  ],
+  "comment": "过程基本正确，第二次握手的目的说明不足。"
+}

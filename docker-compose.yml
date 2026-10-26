@@ -1,0 +1,41 @@
+# 本地开发用的 MySQL 8。
+#
+# 只需要数据库时：docker compose up -d mysql
+# 建库 + 建表一步到位：./scripts/dev-db.sh up
+#
+# 国内网络拉不动官方镜像时，把 MYSQL_IMAGE 换成镜像站地址，例如：
+#   MYSQL_IMAGE=docker.1ms.run/library/mysql:8 docker compose up -d mysql
+
+services:
+  mysql:
+    image: ${MYSQL_IMAGE:-mysql:8.0}
+    container_name: deepjudge-mysql
+    restart: unless-stopped
+    command:
+      # utf8mb4 是唯一能完整存下 emoji 的字符集；emoji 不做特殊处理，越简单越不容易坏。
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      # 时间统一按东八区解读，避免"评了多久"这类统计因为时区差 8 小时
+      - --default-time-zone=+08:00
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-devroot}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-deepjudge}
+      MYSQL_USER: ${MYSQL_USER:-deepjudge}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-deepjudge}
+    ports:
+      # 映射到 3307，避开本机可能已有的 3306
+      - "${MYSQL_PORT:-3307}:3306"
+    volumes:
+      - deepjudge_mysql:/var/lib/mysql
+    healthcheck:
+      # 用 CMD-SHELL 而不是 CMD：数组写法不经过 shell，$$MYSQL_ROOT_PASSWORD 不会被展开
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -uroot -p"$$MYSQL_ROOT_PASSWORD" --silent
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+volumes:
+  deepjudge_mysql:

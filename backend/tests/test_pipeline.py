@@ -5,27 +5,7 @@ from app.core.prompt import build_messages
 from app.core.rubric import from_dict
 from app.pipeline import GradingError, grade
 from app.providers.fake import CannedProvider
-from tests.fixtures import ANSWER, RUBRIC_DATA
-
-SAMPLE_PAYLOAD = {
-    "items": [
-        {"id": "P1", "hit": True, "level": 1.0,
-         "evidence": "客户端首先发送 SYN 报文，seq=x", "reason": "SYN 与序号均正确"},
-        {"id": "P2", "hit": True, "level": 0.5,
-         "evidence": "服务器回复 SYN=1、ACK=1，seq=y，ack=x+1", "reason": "字段完整但未说明同意接收"},
-        {"id": "P3", "hit": True, "level": 1.0,
-         "evidence": "客户端再发送 ACK=1，seq=x+1，ack=y+1", "reason": "确认关系正确"},
-    ],
-    "deductions": [{"id": "D1", "hit": False, "evidence": ""}],
-    "comment": "过程基本正确，第二次握手的目的说明不足。",
-}
-
-
-def payload_text(**overrides):
-    data = json.loads(json.dumps(SAMPLE_PAYLOAD))
-    data.update(overrides)
-    return json.dumps(data, ensure_ascii=False)
-
+from tests.fixtures import ANSWER, RUBRIC_DATA, payload_text
 
 class GradeOneAnswer(unittest.TestCase):
     def setUp(self):

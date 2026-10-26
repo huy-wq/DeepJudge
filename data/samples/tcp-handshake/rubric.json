@@ -1,0 +1,82 @@
+{
+  "question_id": "Q-01",
+  "stem": "简述 TCP 三次握手的过程，并说明其目的。",
+  "reference_answer": "客户端发送 SYN=1、seq=x；服务器回复 SYN=1、ACK=1、seq=y、ack=x+1；客户端回复 ACK=1、seq=x+1、ack=y+1。目的是同步双方初始序列号、确认收发能力。",
+  "total_score": 10,
+  "items": [
+    {
+      "id": "P1",
+      "desc": "客户端发送 SYN 及初始序列号",
+      "weight": 3,
+      "levels": [
+        {
+          "level": 1.0,
+          "score": 3.0,
+          "criterion": "明确 SYN=1、seq=x 并说明目的"
+        },
+        {
+          "level": 0.5,
+          "score": 1.5,
+          "criterion": "只提到发送连接请求"
+        },
+        {
+          "level": 0.0,
+          "score": 0.0,
+          "criterion": "未提及"
+        }
+      ]
+    },
+    {
+      "id": "P2",
+      "desc": "服务器回复 SYN+ACK",
+      "weight": 4,
+      "levels": [
+        {
+          "level": 1.0,
+          "score": 4.0,
+          "criterion": "SYN、ACK、seq、ack 均正确"
+        },
+        {
+          "level": 0.5,
+          "score": 2.0,
+          "criterion": "只说服务器同意，缺字段"
+        },
+        {
+          "level": 0.0,
+          "score": 0.0,
+          "criterion": "未提及"
+        }
+      ]
+    },
+    {
+      "id": "P3",
+      "desc": "客户端回复 ACK，连接建立",
+      "weight": 3,
+      "levels": [
+        {
+          "level": 1.0,
+          "score": 3.0,
+          "criterion": "ACK 与序号的确认关系正确"
+        },
+        {
+          "level": 0.0,
+          "score": 0.0,
+          "criterion": "未提及或错误"
+        }
+      ]
+    }
+  ],
+  "deductions": [
+    {
+      "id": "D1",
+      "desc": "与四次挥手混淆",
+      "penalty": -2,
+      "cap": -2
+    }
+  ],
+  "rules": {
+    "allow_inference": false,
+    "synonym_ok": true,
+    "ignore_length": true
+  }
+}

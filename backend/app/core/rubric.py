@@ -183,3 +183,45 @@ def load_file(path: str | Path) -> Rubric:
     except json.JSONDecodeError as exc:
         raise RubricError([f"评分标准文件不是合法 JSON：{exc}"]) from exc
     return from_dict(data)
+
+
+def to_dict(rubric: Rubric) -> dict[str, Any]:
+    """Rubric → 可 JSON 序列化的 dict，供入库快照与前端展示。
+
+    与 from_dict 严格互逆：`from_dict(to_dict(r)) == r`，
+    否则"标准快照"四字就是空话——存进去的读出来不是同一份标准。
+    """
+    return {
+        "question_id": rubric.question_id,
+        "stem": rubric.stem,
+        "reference_answer": rubric.reference_answer,
+        "total_score": float(rubric.total_score),
+        "items": [
+            {
+                "id": item.id,
+                "desc": item.desc,
+                "weight": float(item.weight),
+                "levels": [
+                    {
+                        "level": float(level.level),
+                        "score": float(level.score),
+                        "criterion": level.criterion,
+                    }
+                    for level in item.levels
+                ],
+                "must_hit": bool(item.must_hit),
+                "acceptable": list(item.acceptable),
+            }
+            for item in rubric.items
+        ],
+        "deductions": [
+            {
+                "id": deduction.id,
+                "desc": deduction.desc,
+                "penalty": float(deduction.penalty),
+                "cap": float(deduction.cap),
+            }
+            for deduction in rubric.deductions
+        ],
+        "rules": dict(rubric.rules),
+    }

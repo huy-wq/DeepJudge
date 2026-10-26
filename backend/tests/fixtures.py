@@ -1,4 +1,6 @@
-"""测试夹具：一份 TCP 三次握手的评分标准与一份学生答卷。"""
+"""测试夹具：一份 TCP 三次握手的评分标准、一份学生答卷与一份模型输出样本。"""
+
+import json
 
 RUBRIC_DATA = {
     "question_id": "Q-01",
@@ -51,3 +53,38 @@ ANSWER = (
     "客户端再发送 ACK=1，seq=x+1，ack=y+1。"
     "三次握手用于同步双方初始序列号，并确认双方的收发能力。"
 )
+
+SAMPLE_PAYLOAD = {
+    "items": [
+        {
+            "id": "P1",
+            "hit": True,
+            "level": 1.0,
+            "evidence": "客户端首先发送 SYN 报文，seq=x",
+            "reason": "SYN 与序号均正确",
+        },
+        {
+            "id": "P2",
+            "hit": True,
+            "level": 0.5,
+            "evidence": "服务器回复 SYN=1、ACK=1，seq=y，ack=x+1",
+            "reason": "字段完整但未说明同意接收",
+        },
+        {
+            "id": "P3",
+            "hit": True,
+            "level": 1.0,
+            "evidence": "客户端再发送 ACK=1，seq=x+1，ack=y+1",
+            "reason": "确认关系正确",
+        },
+    ],
+    "deductions": [{"id": "D1", "hit": False, "evidence": ""}],
+    "comment": "过程基本正确，第二次握手的目的说明不足。",
+}
+
+
+def payload_text(**overrides) -> str:
+    """把 SAMPLE_PAYLOAD 序列化成模型输出文本，可局部覆盖顶层字段。"""
+    data = json.loads(json.dumps(SAMPLE_PAYLOAD))
+    data.update(overrides)
+    return json.dumps(data, ensure_ascii=False)

@@ -106,7 +106,12 @@ backend/
 │   │   ├── registry.py       # 模型能力表（JSON 输出 / 确定性采样 / 上下文上限）
 │   │   └── <vendor>.py       # 各供应商实现
 │   ├── pipeline.py           # 编排：调用 → 解析 → 校验 → 服务端算分
-│   └── store.py              # 存储接口（MySQL 8）
+│   └── store/                # 存储层（MySQL 8）
+│       ├── tables.py         # 8 张表的定义；方言差异收在 with_variant 里
+│       ├── repository.py     # 写入（一个事务）与读取（还原成领域对象）
+│       └── __init__.py       # 对外只暴露 Store / RunMeta / StoredEvaluation / RunRecord（metadata 给迁移用）
+├── migrations/               # Alembic 迁移脚本（表结构的部署真源）
+├── alembic.ini
 ├── tests/                    # 纯函数单测 + 合成用例回归
 └── scripts/                  # check（不调模型）/ run（真调模型）
 ```
@@ -116,12 +121,17 @@ backend/
 | 层 | 模块 | 允许依赖 |
 | --- | --- | --- |
 | 入口 | `main.py`、`api/` | 以下全部 |
-| 编排 | `pipeline.py`（后续加入）、`store.py` | core、providers |
+| 编排 | `pipeline.py` | core、providers |
+| 编排 | `store/repository.py` | core、providers，以及 `pipeline.Evaluation`（"一次评分的产出"这个类型由 pipeline 定义） |
 | 领域逻辑 | `core/*` | 仅标准库 + pydantic |
-| 适配 | `providers/*`、`store.py` | 外部 SDK |
+| 适配 | `providers/*`（厂商 SDK）、`store/tables.py`（SQLAlchemy 方言） | 外部依赖 |
 | 工具 | `scripts/*`、`tests/*` | 全部 |
 
 `core/` 必须不 import 任何厂商 SDK，也不读环境变量——这是"可单测、可替换"的物理保证。
+`store/` 是唯一允许依赖 SQLAlchemy 的地方；`pipeline.py` 只认 `Store` 的方法，不碰 SQL。
+反过来，`pipeline` **不** import `store`：谁调谁由入口决定，编排层之间保持单向。
+
+根目录的 `docker-compose.yml` 与 `scripts/dev-db.sh` 属于部署工具，不参与模块依赖。
 
 ## 4. 核心数据结构
 
@@ -190,20 +200,44 @@ backend/
 ### 4.4 存储表（MySQL 8，逻辑模型与库无关）
 
 ```text
-questions(id, stem, type, total_score, status)
+questions(id, code, stem, type, total_score, status, created_at)
 rubrics(id, question_id, version, schema_json, checksum, created_at)
-answers(id, question_id, student_pseudo_id, raw_text, normalized_text, truncated)
-grading_runs(id, answer_id, rubric_version, prompt_version, model, params_json,
-             status, tokens_in, tokens_out, latency_ms, error)
-item_results(id, run_id, rubric_item_id, level, hit, evidence, span_start, span_end,
-             grounded, reason)
-aggregated_results(id, answer_id, levels_json, raw_score, calibrated_score,
-                   dispersion, confidence, grounding_rate, route, calibration_version)
-reviews(id, aggregated_result_id, reviewer_id, final_score, decision, comment)
-calibration_models(id, version, method, params_json, train_size, metrics_json)
+answers(id, question_id, student_pseudo_id, raw_text, normalized_text, truncated, created_at)
+grading_runs(id, answer_id, rubric_id, prompt_version, model, params_json, status,
+             score, comment, tokens_in, tokens_out, latency_ms, error, created_at)
+item_results(id, run_id, kind, rubric_item_id, level, hit, evidence,
+             span_start, span_end, grounded, reason)
+aggregated_results(id, answer_id, rubric_id, sample_run_ids, levels_json, sample_totals_json,
+                   raw_score, calibrated_score, max_score, dispersion, total_range,
+                   confidence, grounding_rate, route, risk, reasons_json,
+                   applied_deductions_json, calibration_version, created_at)
+reviews(id, aggregated_result_id, reviewer_id, final_score, decision, comment, created_at)
+calibration_models(id, version, method, params_json, train_size, metrics_json, created_at)
 ```
 
+**几条必须写明的约定：**
+
+| 约定 | 理由 |
+| --- | --- |
+| `questions.code` 存业务编号（`Q-01`），其余表用整型外键 | 人能读的编号与数据库主键分开，改编号不会牵动全库 |
+| `grading_runs.rubric_id` 指向不可变快照，不再存 `rubric_version` | 版本号存两处必然漂移；外键指过去，版本号 join 出来 |
+| `rubrics` 只增不改，`checksum` 是 `schema_json` 的 sha256 | 内容没变就复用最新一版；变了追加一版。旧运行永远显示当时的标准 |
+| `item_results.kind` 区分 `item` / `deduction`，`level` 可空 | 扣分项没有等级、只有命中与否，硬塞进同一个字段会造出"扣分项等级 0"这种假数据 |
+| 分值统一 `DOUBLE` 且 `asdecimal=False` | 否则 MySQL 回来是 `Decimal`、SQLite 回来是 `float`，同一份结果两副面孔 |
+| 所有表 `utf8mb4` + `InnoDB` | 唯一能完整存下 emoji 的字符集；中文不需要特殊照顾，不需要照顾的才不容易坏 |
+| `span_start`/`span_end` 是**原文**偏移 | 高亮要落在学生原话上，规范化后的文本只作审计与检索 |
+| `calibrated_score` 与 `calibration_version` 校准上线前恒为 `NULL` | 字段先留，语义不含糊：`NULL` 就是"没校准"，不是"校准为 0" |
+
 `student_pseudo_id` 是脱敏占位符，不存姓名学号。审计日志与申诉表留到有真实用户时再加。
+
+**表结构怎么落地**
+
+- 代码真源是 `backend/app/store/tables.py`；部署真源是 `backend/migrations/`（Alembic）。
+- 两者由一条测试强制对齐：真的跑一遍 `upgrade head` / `downgrade base`，再把迁移出来的
+  表名、列、可空性、索引、唯一约束、外键与 `tables.py` 逐项对照。只有这样，"测试库建得起来"
+  才等于"生产库建得起来"。
+- 一键建库：`./scripts/dev-db.sh up`（起 MySQL → 等就绪 → `alembic upgrade head`），
+  连数据一起重来用 `reset`。
 
 ## 5. 教师端：评分标准怎么产生
 
@@ -361,7 +395,9 @@ system 中的三条硬纪律：
 | 语言 / 框架 | **已定** Python 3.10+ / FastAPI | 只承担 API 层 |
 | 服务形态 | **已定** 单体 | 课题规模不需要拆服务 |
 | LLM 供应商与参数 | **已接入** DeepSeek | `providers/deepseek.py`，标准库实现；模型、超时、思考强度均可配 |
-| 存储 | **已定** MySQL 8 | `utf8mb4`；表结构见 4.4，逻辑模型与库无关 |
+| 存储 | **已实现** MySQL 8 | `utf8mb4` / InnoDB；表结构见 4.4，逻辑模型与库无关 |
+| 迁移工具 | **已定** Alembic | 表结构代码真源 `store/tables.py`，部署真源 `migrations/`，由测试强制对齐 |
+| 数据库访问 | **已定** SQLAlchemy 2.0 Core + PyMySQL | 只有 `store/` 依赖它；`core/` 与 `pipeline.py` 不碰 SQL |
 | 任务执行 | 待定 | 进程内后台任务起步，压力上来再换 worker |
 | 前端 | **已定** Vue 3 | 组件库待定；复核界面是必需项 |
 | 认证 | **已定** 单口令 + cookie | 口令存 `ADMIN_PASSWORD`；公网需 HTTPS |

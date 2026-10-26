@@ -1,7 +1,8 @@
 import copy
+import json
 import unittest
 
-from app.core.rubric import RubricError, from_dict
+from app.core.rubric import RubricError, from_dict, to_dict
 from tests.fixtures import RUBRIC_DATA
 
 
@@ -78,6 +79,17 @@ class CollectEveryStructuralProblem(unittest.TestCase):
             from_dict(data)
 
         self.assertTrue(any("P1" in p and "score" in p for p in ctx.exception.problems))
+
+
+class SerializeRubric(unittest.TestCase):
+    def test_to_dict_round_trips_through_from_dict(self):
+        original = from_dict(copy.deepcopy(RUBRIC_DATA))
+        restored = from_dict(to_dict(original))
+        self.assertEqual(restored, original)
+
+    def test_to_dict_output_is_plain_json_data(self):
+        payload = to_dict(from_dict(copy.deepcopy(RUBRIC_DATA)))
+        self.assertEqual(json.loads(json.dumps(payload)), payload)
 
 
 if __name__ == "__main__":

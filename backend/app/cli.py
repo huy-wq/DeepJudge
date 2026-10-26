@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -29,7 +30,6 @@ def build_report(evaluation: Evaluation, rubric) -> dict:
         ),
     )
     representative = evaluation.samples[representative_index]
-    by_id = {judgement.item_id: judgement for judgement in representative.items}
     deduction_by_id = {deduction.id: deduction for deduction in representative.deductions}
 
     items = []
@@ -94,6 +94,46 @@ def build_report(evaluation: Evaluation, rubric) -> dict:
     }
 
 
+class SaveError(Exception):
+    """写入数据库失败。与评分失败区分开：评分是对的，只是没存下来。"""
+
+
+def _save(evaluation, rubric, answer: str, args, model: str) -> dict:
+    """落库。表结构不在这里创建——建表只能走迁移，否则线上会悄悄少列。
+
+    `model` 由调用方给：离线模式没有模型可记，就记空串，而不是编一个默认型号。
+    """
+    url = args.database_url or os.environ.get("DATABASE_URL", "")
+    if not url:
+        raise SaveError("未设置 DATABASE_URL，也没有给 --database-url")
+
+    try:
+        from .store import RunMeta, Store
+    except ImportError as exc:
+        raise SaveError(f"缺少数据库依赖（sqlalchemy / pymysql）：{exc}") from exc
+
+    store = Store.from_url(url)
+    try:
+        stored = store.save_evaluation(
+            rubric=rubric,
+            answer_text=answer,
+            evaluation=evaluation,
+            meta=RunMeta(model=model),
+            student_pseudo_id=args.pseudo_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - 数据库错误一律转成人能读的一句话
+        raise SaveError(str(exc)) from exc
+    finally:
+        store.dispose()
+
+    return {
+        "answer_id": stored.answer_id,
+        "run_ids": stored.run_ids,
+        "aggregate_id": stored.aggregate_id,
+        "rubric_id": stored.rubric_id,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="deepjudge", description="单份答卷评分")
     parser.add_argument("--rubric", required=True, help="评分标准 JSON")
@@ -102,9 +142,18 @@ def main(argv: list[str] | None = None) -> int:
     source.add_argument("--response", help="离线：预置的模型输出（JSON 文本）")
     source.add_argument("--live", action="store_true", help="在线：调用 DeepSeek API")
     parser.add_argument("--samples", type=int, default=1, help="采样次数（默认 1）")
+    parser.add_argument(
+        "--save", action="store_true", help="把本次评分写入数据库（需 DATABASE_URL 或 --database-url）"
+    )
+    parser.add_argument("--database-url", help="覆盖环境变量 DATABASE_URL")
+    # 默认值与 store.DEFAULT_PSEUDO_ID 一致，但不能在模块顶层 import 它：
+    # CLI 必须在没装 sqlalchemy 的环境里也能跑（离线评分不依赖数据库）。
+    parser.add_argument("--pseudo-id", default="anon", help="学生脱敏编号（默认 anon）")
     args = parser.parse_args(argv)
     if args.samples < 1:
         parser.error("--samples 必须大于等于 1")
+
+    load_project_env()
 
     try:
         rubric = load_file(args.rubric)
@@ -115,14 +164,15 @@ def main(argv: list[str] | None = None) -> int:
 
     answer = Path(args.answer).read_text(encoding="utf-8")
 
+    model = ""
     if args.live:
-        load_project_env()
         try:
             config = DeepSeekConfig.from_env()
         except ProviderError as exc:
             print(f"无法调用模型：{exc}", file=sys.stderr)
             return 4
         provider = DeepSeekProvider(config)
+        model = config.model
     else:
         provider = CannedProvider([Path(args.response).read_text(encoding="utf-8")])
 
@@ -139,7 +189,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"评分失败：{exc}", file=sys.stderr)
         return 3
 
-    print(json.dumps(build_report(evaluation, rubric), ensure_ascii=False, indent=2))
+    report = build_report(evaluation, rubric)
+
+    if args.save:
+        try:
+            report["stored"] = _save(evaluation, rubric, answer, args, model)
+        except SaveError as exc:
+            print(f"写入数据库失败：{exc}", file=sys.stderr)
+            return 5
+
+    print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
 

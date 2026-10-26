@@ -36,7 +36,11 @@ DeepJudge/
 │   ├── experiments.md   # 实验记录（真实调用的设置与结果）
 │   ├── agents/          # issue tracker / 标签 / 领域文档约定
 │   └── tooling.md       # 本地工具配置
-├── backend/             # Python + FastAPI（目录待创建，结构见架构文档第 3 节）
+├── backend/             # Python + FastAPI 评分引擎（结构见架构文档第 3 节）
+│   ├── migrations/      # Alembic 迁移（表结构的部署真源）
+│   └── tests/           # 单测与真库验证
+├── scripts/dev-db.sh    # 本地数据库一键起库 + 升级表结构
+├── docker-compose.yml   # 本地 MySQL 8（utf8mb4）
 ├── frontend/            # 复核界面（选型待定，目录待创建）
 └── data/                # 本地答卷与标注集，默认不入库
 ```
@@ -48,7 +52,7 @@ DeepJudge/
 | 语言 / 运行时 | Python 3.10+ | **已定** |
 | Web 框架 | FastAPI | **已定** |
 | 服务形态 | 单体后端 | **已定** |
-| 存储 | MySQL 8（`utf8mb4`） | **已定** |
+| 存储 | MySQL 8（`utf8mb4`）+ Alembic 迁移 | **已实现** |
 | 任务执行 | 进程内后台任务 / 独立 worker | 待定 |
 | 前端 | Vue 3 | **已定**（组件库待定） |
 | LLM 供应商与参数 | DeepSeek（`providers/deepseek.py`，标准库实现） | **已接入** |
@@ -73,6 +77,40 @@ DeepJudge/
 ```bash
 git clone git@github.com:huy-wq/DeepJudge.git && cd DeepJudge
 python3 -m venv .venv && source .venv/bin/activate
-cp .env.example .env          # LLM API key，变量名待供应商确定
-# 依赖安装与启动在骨架落地后补充
+pip install -e backend        # 引擎 + 存储依赖（sqlalchemy / alembic / pymysql）
+cp .env.example .env          # 填 DEEPSEEK_API_KEY；DATABASE_URL 指向本地库
+```
+
+**起库并建表（一条命令，可重复执行）**
+
+```bash
+./scripts/dev-db.sh up
+```
+
+它做三件事：用 `docker-compose.yml` 起 MySQL 8（端口 3307，避免和本机 3306 撞）、等健康检查通过、
+在 `backend/` 下跑 `alembic upgrade head`。要连数据一起重来用 `./scripts/dev-db.sh reset`。
+
+拉不动官方镜像时换镜像站：`MYSQL_IMAGE=docker.1ms.run/library/mysql:8 ./scripts/dev-db.sh up`
+
+**跑一次评分并把结果落库**
+
+```bash
+cd backend
+# 离线：用预置的模型输出，不花钱、不联网
+python3 -m app.cli --rubric ../data/samples/tcp-handshake/rubric.json --answer ../data/samples/tcp-handshake/answer.txt \
+    --response ../data/samples/tcp-handshake/response.json --samples 3 --save
+```
+
+输出里的 `stored.answer_id` / `run_ids` / `aggregate_id` 就是库里的主键，可以用 `Store.load_evaluation()`
+原样读回：标准快照、答卷、每次采样、逐条证据与偏移、聚合指标、路由结论，一个字段都不少。
+
+**跑测试**
+
+```bash
+cd backend
+python3 -m unittest discover -s tests -t .              # 无需数据库，缺依赖时自动跳过存储用例
+DEEPJUDGE_TEST_MYSQL_URL='mysql+pymysql://deepjudge:deepjudge@127.0.0.1:3307/deepjudge?charset=utf8mb4' \
+  python3 -m unittest tests.test_store_mysql             # MySQL 真库：字符集与 emoji
+# 该用例每次新建 deepjudge_test_<随机> 临时库、跑完删掉，不会动你给的库里的数据；
+# 连接账号需要有 CREATE DATABASE 权限，没有就自动 skip
 ```
