@@ -1,0 +1,23 @@
+[project]
+name = "deepjudge"
+version = "0.1.0"
+description = "基于 DeepSeek 的主观试题评判系统"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "pydantic>=2.6",
+  "sqlalchemy>=2.0",
+  "pymysql>=1.1",
+  "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]

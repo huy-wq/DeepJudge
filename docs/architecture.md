@@ -79,7 +79,8 @@ backend/
 │   │   ├── base.py           # GradingProvider 协议
 │   │   ├── registry.py       # 模型能力表（JSON 输出 / 确定性采样 / 上下文上限）
 │   │   └── <vendor>.py       # 各供应商实现
-│   └── store.py              # 存储接口（开发期 SQLite）
+│   ├── pipeline.py           # 编排：调用 → 解析 → 校验 → 服务端算分
+│   └── store.py              # 存储接口（MySQL 8）
 ├── tests/                    # 纯函数单测 + 合成用例回归
 └── scripts/                  # check（不调模型）/ run（真调模型）
 ```
