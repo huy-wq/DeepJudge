@@ -63,6 +63,7 @@
 backend/
 ├── app/
 │   ├── main.py               # FastAPI 装配：挂路由、异常处理、启动校验
+│   ├── config.py             # .env 读取（无第三方依赖）
 │   ├── api/
 │   │   ├── routes.py         # 提交 / 查询 / 复核 三组接口
 │   │   └── schemas.py        # 请求响应模型（pydantic）
@@ -334,7 +335,7 @@ system 中的三条硬纪律：
 | --- | --- | --- |
 | 语言 / 框架 | **已定** Python 3.10+ / FastAPI | 只承担 API 层 |
 | 服务形态 | **已定** 单体 | 课题规模不需要拆服务 |
-| LLM 供应商与参数 | **待补充** | 由 `providers/` 隔离；接入时把能力写进 `registry.py` |
+| LLM 供应商与参数 | **已接入** DeepSeek | `providers/deepseek.py`，标准库实现；模型、超时、思考强度均可配 |
 | 存储 | **已定** MySQL 8 | `utf8mb4`；表结构见 4.4，逻辑模型与库无关 |
 | 任务执行 | 待定 | 进程内后台任务起步，压力上来再换 worker |
 | 前端 | **已定** Vue 3 | 组件库待定；复核界面是必需项 |

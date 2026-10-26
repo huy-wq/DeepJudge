@@ -94,3 +94,21 @@
 ### 未决
 
 - 无新增。上一张票的「最高等级分值是否必须等于权重」仍待拍板。
+
+---
+
+## 附：接入 DeepSeek Provider（2026-10-26）
+
+| 问题 | 现象与原因 | 处理 | 教训 |
+| --- | --- | --- | --- |
+| 装不上官方 SDK | 环境无外网，`openai` 包无法安装 | 用标准库 `urllib` 直接发 OpenAI 兼容请求 | 反而更符合"core 不依赖厂商 SDK"的约束；一个 JSON POST 不值得引入一个包 |
+| 思考模式下 `temperature` 不生效 | 官方文档明确该参数会被忽略 | 请求体里干脆不发 `temperature`，只发 `thinking` 与 `reasoning_effort` | "传了但无效"比"不传"更容易骗过自己，代码里要能看出这个决定 |
+| 没有密钥，无法真实联调 | 本机没有 `DEEPSEEK_API_KEY` | 把 HTTP 传输做成可注入的 `transport`，用假 transport 测请求形状、错误映射与空响应 | 外部依赖留一个可替换的传输层，测试就能覆盖 90% 的代码而不联网 |
+| CLI 与配置耦合 | 密钥、模型、超时都从环境变量来 | 加 `--live` 开关与极简 `.env` 读取；`--response` 保留为离线路径 | 在线与离线两条路都要能跑，答辩现场断网也不至于没东西演示 |
+
+真实调用仍需你提供密钥。填入 `backend/.env` 或仓库根 `.env` 后：
+
+```bash
+cd backend
+python3 -m app.cli --rubric r.json --answer a.txt --live
+```

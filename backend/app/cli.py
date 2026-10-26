@@ -12,7 +12,10 @@ import sys
 from pathlib import Path
 
 from .pipeline import GradingError, grade
+from .config import load_project_env
 from .core.rubric import RubricError, load_file
+from .providers.base import ProviderError
+from .providers.deepseek import DeepSeekConfig, DeepSeekProvider
 from .providers.fake import CannedProvider
 
 
@@ -53,7 +56,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="deepjudge", description="单份答卷评分")
     parser.add_argument("--rubric", required=True, help="评分标准 JSON")
     parser.add_argument("--answer", required=True, help="学生答卷（纯文本）")
-    parser.add_argument("--response", required=True, help="模型输出（JSON 文本，离线运行）")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--response", help="离线：预置的模型输出（JSON 文本）")
+    source.add_argument("--live", action="store_true", help="在线：调用 DeepSeek API")
     args = parser.parse_args(argv)
 
     try:
@@ -64,10 +69,24 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     answer = Path(args.answer).read_text(encoding="utf-8")
-    response = Path(args.response).read_text(encoding="utf-8")
+
+    if args.live:
+        load_project_env()
+        try:
+            config = DeepSeekConfig.from_env()
+        except ProviderError as exc:
+            print(f"无法调用模型：{exc}", file=sys.stderr)
+            return 4
+        provider = DeepSeekProvider(config)
+    else:
+        provider = CannedProvider([Path(args.response).read_text(encoding="utf-8")])
 
     try:
-        result = grade(rubric, answer, CannedProvider([response]))
+        result = grade(rubric, answer, provider)
+    except ProviderError as exc:
+        hint = "（可重试）" if exc.retryable else "（不可重试）"
+        print(f"模型调用失败{hint}：{exc}", file=sys.stderr)
+        return 4
     except GradingError as exc:
         print(f"评分失败：{exc}", file=sys.stderr)
         return 3

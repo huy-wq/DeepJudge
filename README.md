@@ -50,7 +50,7 @@ DeepJudge/
 | 存储 | MySQL 8（`utf8mb4`） | **已定** |
 | 任务执行 | 进程内后台任务 / 独立 worker | 待定 |
 | 前端 | Vue 3 | **已定**（组件库待定） |
-| LLM 供应商与参数 | — | **待补充** |
+| LLM 供应商与参数 | DeepSeek（`providers/deepseek.py`，标准库实现） | **已接入** |
 | 部署 | 本地优先 | 待定 |
 
 评分引擎只依赖 `GradingProvider` 一个接口（见架构文档第 2、3 节），换模型不影响流水线与测试。
