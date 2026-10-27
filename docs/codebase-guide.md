@@ -6,10 +6,10 @@
 >
 > 若两者冲突，以 `docs/architecture.md` 为准；发现冲突请改本文件。
 
-**当前状态**：309 个后端用例（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
+**当前状态**：315 个后端用例（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
 裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归）
-+ 33 个前端用例（Vitest + jsdom，见 §2 ⑮），约 13000 行（含文档与测试）。
-已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成、#11 标准保存与迭代、#12 前端骨架。
++ 54 个前端用例（Vitest + jsdom，见 §2 ⑮/⑯），约 13000 行（含文档与测试）。
+已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成、#11 标准保存与迭代、#12 前端骨架、#13 标准编辑页。
 **没有**的部分见 §8，别在代码里找不存在的东西。
 
 ---
@@ -47,7 +47,7 @@ backend/
 │   ├── cli.py           ← 命令行入口与报告组装
 │   └── config.py        ← .env 读取
 ├── migrations/          ← Alembic 迁移（表结构的部署真源）
-├── tests/               ← 309 个用例
+├── tests/               ← 315 个用例
 └── scripts/             ← 实验脚本（backend/scripts，如方差实测）
 
 frontend/                ← 管理端骨架（Vue 3 + Vite + TS + Element Plus）
@@ -57,8 +57,8 @@ frontend/                ← 管理端骨架（Vue 3 + Vite + TS + Element Plus�
 ├── src/feedback.ts      ← 统一错误提示（ElMessage）
 ├── src/components/      ← ErrorBoundary（渲染错误不白屏）
 ├── src/layouts/         ← AdminLayout
-├── src/views/           ← 登录 / 首页 / 404
-├── tests/               ← 33 个用例（Vitest + jsdom）
+├── src/views/           ← 登录 / 首页 / 标准列表 / 标准编辑 / 404 / 加载失败
+├── tests/               ← 54 个用例（Vitest + jsdom）
 └── vite.config.ts       ← dev proxy /api → :8000；Vitest 配置
 
 仓库根目录还有：docker-compose.yml（本地 MySQL 8）、scripts/dev-db.sh（一键起库 + 迁移）。
@@ -84,7 +84,8 @@ frontend/                ← 管理端骨架（Vue 3 + Vite + TS + Element Plus�
 | `frontend/src/api/` | 约 160 | 浏览器 `fetch` | ⑮（前端骨架） |
 | `frontend/src/session.ts` + `router/` | 约 160 | vue + vue-router | ⑮ |
 | `frontend/src/feedback.ts` + `components/` | 约 70 | Element Plus | ⑮ |
-| `frontend/src/views/` + `layouts/` | 约 240 | 以上 | ⑮ |
+| `frontend/src/views/` + `layouts/` | 约 700 | 以上 | ⑮ / ⑯ |
+| `frontend/src/components/rubrics/` | 约 210 | Element Plus | ⑯ |
 
 **依赖方向是硬约束，不是风格建议。** 可以用一条命令自己验：
 
@@ -869,7 +870,7 @@ python3 -m unittest tests.test_api_reviews -v   # 25 个用例：HTTP 层
 ```bash
 cd backend
 python3 -m unittest tests.test_rubric_store -v   # 10 个用例：版本、列表、溯源、任务快照
-python3 -m unittest tests.test_api_rubrics -v    # 20 个用例：生成 → 保存 → 编辑 → 迭代
+python3 -m unittest tests.test_api_rubrics -v    # 26 个用例：生成 → 保存 → 编辑 → 迭代 → 实时校验
 ```
 
 **读完要能回答**：为什么行内编辑要"追加一版"而不是"改那一行"？
@@ -912,13 +913,51 @@ python3 -m unittest tests.test_api_rubrics -v    # 20 个用例：生成 → 保
 ```bash
 cd frontend
 npm install
-npm run test        # 33 个用例：守卫、会话、统一错误、退出、ErrorBoundary
+npm run test        # 54 个用例：守卫、会话、标准编辑、统一错误、退出、ErrorBoundary
 npm run typecheck
 npm run build
 ```
 
 **读完要能回答**：为什么刷新页面后还保持登录，而不是"前端把登录态存在了哪里"？
 （存在服务端；cookie 是 HttpOnly 的，前端只负责带着它去问 `/api/auth/session`。）
+
+---
+
+### ⑯ 标准编辑页：`src/views/RubricEditorView.vue` + `api/rubrics.ts`（约 30 分钟）
+
+**职责**：生成 → 检查 → 微调 → 保存，一屏完成。校验规则只有服务端一份。
+
+| 位置 | 在干什么 | 读的时候注意 |
+| --- | --- | --- |
+| `api/rubrics.ts` | 标准相关接口的类型与调用 | `generate` / `iterate` 返回三视图；`validate` 只读、不落库 |
+| `RubricEditorView.vue:419` watch | 任何字段或表格改动都重新排一次校验 | 防抖 200ms；`runValidation` 用序号丢弃过期响应 |
+| `:173` `runValidation` | 调服务端校验并更新清单 | 网络失败时保存要中止，不能拿旧清单放行 |
+| `:105` `canSave` | 保存按钮的唯一判据 | 阻断项、未确认提示、原话为空、校验中，任一成立都不可存 |
+| `:214` `toggleAcknowledged` | 提示项的"已知悉" | key 是 `code|message`，内容改了要重新确认 |
+| `:296` `generate` | 题干 + 满分 + 原话 → 草稿 | 草稿不落库；生成后仍需保存 |
+| `:325` `iterate` | 上一版 + 一条意见 | 依赖已保存的 `baseId`；响应里的 `changes` 直接展示 |
+| `:350` `save` | 保存前再校验一次 | POST 首存 / PUT 追加版本；成功后 replace 到 `/rubrics/{id}` |
+| `components/rubrics/ChecklistPanel.vue:16` | 阻断红色、提示黄色 | 只渲染，不自己判断合法性 |
+| `RubricListView.vue` | 列表、"新建"与"打开" | 列表只显示每道题的最新版 |
+
+**一处值得抄的取舍**：编辑页没有把校验规则抄一份到前端。
+`POST /api/rubrics/validate` 复用服务端 `parse()`，"页面说能存"和"保存真的能过"不会打架。
+代价是每次编辑多一次请求，而且离线时编辑不可用。
+
+失败态也在这里：`runValidation` 拿不到结果时不清 `dirty`、不让保存，清单面板改显示
+"校验失败，清单可能过期"——宁可让教师重试，也不拿旧清单放行。
+另外，离开页面前会确认未保存的改动（只覆盖路由内导航，关标签页仍会丢）。
+
+**动手验证**：
+
+```bash
+cd frontend
+npm run test -- tests/rubric-editor.test.ts    # 14 个用例：三视图、阻断、提示确认、失败态、并发、保存、迭代
+npm run test -- tests/rubric-list.test.ts      # 3 个用例：列表、打开、空状态
+```
+
+**读完要能回答**：为什么阻断项要禁用保存，而提示项只要求勾"已知悉"？
+（阻断项是标准本身不成立，存了也评不了分；提示项是"能算分但可能不可靠"，判断权在教师。）
 
 ---
 
@@ -986,7 +1025,7 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 | `test_deepseek_provider.py` | 12 | 请求形状、状态码映射、空响应重试、配置读取（含生成/评分模型分开配）（**不联网**） |
 | `test_rubric_gen.py` | 30 | 生成提示词含纪律；迭代只改指出的部分；重试带上错误且禁止补点；模型改不了 `rules`/`must_hit`；三视图各就各位 |
 | `test_rubric_store.py` | 10 | 版本只增不改；列表只给最新版；题干与满分同步；任务快照不被后续编辑移动 |
-| `test_api_rubrics.py` | 20 | 生成 → 保存 → 列表/打开 → 行内编辑 → 迭代；结构错误逐条拒绝；题号不可改；编辑后任务仍指旧版 |
+| `test_api_rubrics.py` | 26 | 生成 → 保存 → 列表/打开 → 行内编辑 → 迭代；结构错误逐条拒绝；题号不可改；编辑后任务仍指旧版 |
 | `test_gen_rubric_script.py` | 6 | 生成脚本的退出码（含模型调用失败）与三视图输出；保存的标准能直接喂给评分 |
 | `test_cli.py` | 5 | 报告字段齐全；错误码；`--save` 能读回 |
 | `test_store.py` | 17 | 字段无损往返；标准快照不可变；重评后按旧运行号不会串到新结论；导入与查重 |
@@ -1011,6 +1050,9 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 | `tests/login.test.ts` | 4 | 登录成功进首页、口令错误只贴表单不重复弹窗、空口令不发请求 |
 | `tests/layout.test.ts` | 4 | 退出回登录页、退出 401 也回登录页、错误卡只换内容区、退出失败留在管理端 |
 | `tests/error-boundary.test.ts` | 1 | 子组件抛错显示错误卡片，不白屏 |
+| `tests/rubrics-api.test.ts` | 4 | 校验/保存/列表的请求形状；提示 key 稳定 |
+| `tests/rubric-editor.test.ts` | 14 | 三视图同屏、改行后实时校验、阻断禁用保存、提示需确认、校验失败禁用保存、摘要随编辑更新、迭代/保存互斥、离开确认 |
+| `tests/rubric-list.test.ts` | 3 | 列表、打开某一版、空状态 |
 
 **测试里的接缝（seam）**，读懂这三个就够了：
 
@@ -1130,6 +1172,7 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 | 加字段落库 | `store/tables.py` + 新迁移 + `save/load` | 其它层 |
 | 加 HTTP 接口 | `app/api/*.py` 里加 `register(app)`，受保护接口挂 `Depends(require_admin)`，要库的挂 `Depends(require_store)` | `core/`、`auth.py` |
 | 加一个管理端页面 | `frontend/src/views/` 新建组件 + `router/index.ts` 挂到管理布局下 + `frontend/src/api/` 加对应请求 | `frontend/src/api/client.ts`（除非要改错误形状） |
+| 改标准编辑页的校验呈现 | `components/rubrics/ChecklistPanel.vue` | 校验规则本身（在 `backend/core/rubric.py`） |
 | 改统一错误文案 | `frontend/src/feedback.ts` 或 `frontend/src/api/client.ts` 的兜底 | 各页面的模板 |
 | 改导入格式（如 Excel） | `app/importing.py` 加一个 `source` 分支 | `store/`、`api/` |
 | 换会话存储（Redis / 数据库） | 只换 `AdminAuth` 的登记表实现 | `api/`、`main.py` |
@@ -1157,7 +1200,7 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 | 导入批次撤销 | 未定 | 只能按 answer_id 删；验收只要求"取消导入不产生数据"，已满足 |
 | 分数校准 | 校准层 | `core/calibrate.py` **不存在**；`calibrated_score` 恒为 `NULL` |
 | 模型能力注册表 | 后续 | `providers/registry.py` **不存在** |
-| 标准编辑页 / 导入与任务页 / 复核页 | #13–#15 | 骨架已在 `frontend/`，业务页未接 |
+| 导入与任务页 / 复核页 | #14–#15 | 骨架与标准页已在 `frontend/` |
 | token / 耗时统计 | 后续 | `grading_runs.tokens_in/latency_ms` 列存在但恒为 `NULL` |
 
 ---

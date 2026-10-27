@@ -166,9 +166,9 @@ frontend/                     # 管理端（Vue 3 + Vite + TypeScript + Element 
 │   ├── session.ts            # 登录态：/api/auth/session 只确认一次
 │   ├── feedback.ts           # 统一错误提示（ElMessage）
 │   ├── router/index.ts       # 路由与登录守卫
-│   ├── components/           # ErrorBoundary（渲染错误兜底）
+│   ├── components/           # ErrorBoundary；rubrics/ 里的预览表与校验清单
 │   ├── layouts/              # AdminLayout
-│   └── views/                # LoginView / HomeView / NotFoundView / LoadErrorView
+│   └── views/                # Login / Home / RubricList / RubricEditor / NotFound / LoadError
 ├── tests/                    # Vitest + jsdom
 └── vite.config.ts            # dev proxy /api → :8000；Vitest 配置
 ```
@@ -398,6 +398,10 @@ system 中的三条硬纪律：
 - **行内编辑**：直接在预览表上改某一行（权重、描述、等级分值）。
   接口是 `PUT /api/rubrics/{id}`：整份提交，服务端校验后**追加一版**，旧版原样保留。
 
+编辑页**不复制一份校验规则**：每次改动（防抖 200ms）调用 `POST /api/rubrics/validate`，
+服务端用同一个 `parse()` 返回阻断项与提示项。这样"页面上的校验清单"与"保存时的判断"
+永远是同一套；代价是每次编辑多一次请求（只读，不写库，也不需要数据库）。
+
 迭代响应附带服务端算出的**变更清单**（哪些采分点新增 / 删除 / 改了哪个字段）。模型能不能
 "只改被指出的部分"无法由代码强制，但差异必须当场可见——否则教师得逐行比对两份标准，
 才能发现模型顺手动了别处。
@@ -501,6 +505,9 @@ system 中的三条硬纪律：
 | 错误文案只有一个映射 | `ApiError` + `errorMessage` 统一生成可读句子；登录失败贴在表单旁，其余错误用全局提示 | 同一条错误不会两处同时出现，但需要页面自己选呈现方式 |
 | 两级渲染兜底 | `AdminLayout` 内层 `ErrorBoundary` 只替换内容区（导航还在）；`App` 外层兜住登录页等其余渲染错误 | 内层边界随路由 remount，会丢掉出错页面的本地状态 |
 | 懒加载失败有回退页 | `router.onError` + 主包里的 `/load-error`：chunk 加载失败不会只留白屏 | 回退页只提供"刷新"，不能自动重试 |
+| 编辑页的校验走服务端 | 页面不复制校验规则；改动防抖后调 `/api/rubrics/validate`，阻断项禁用保存、提示项要勾"已知悉" | 每次编辑多一次请求；离线时无法继续编辑 |
+| 校验失败不沿用旧清单 | 拿不到结果时禁用保存并提示重试；旧清单可能已与当前内容不符 | 网络抖动时不能继续存，只能重试 |
+| 离开页面前确认未保存改动 | `onBeforeRouteLeave` 覆盖路由跳转；关标签页/刷新不拦截 | 不是完整的草稿保护，大改动仍可能丢 |
 | 开发期用 Vite 代理 `/api` | 前后端同源，cookie 与 CORS 都不用额外配置 | 生产部署必须让静态站点与 `/api` 同源（反代） |
 
 **测试边界**：Vitest 只断言"行为"——守卫去了哪个路由、请求发了什么、错误提示是不是可读；
@@ -578,7 +585,7 @@ system 中的三条硬纪律：
 | 任务执行 | **已实现** 进程内线程池 | `GRADING_CONCURRENCY`（默认 2，上限 4）。重启时把 running 任务标为 interrupted 并可重试；多 worker 部署需换共享队列 |
 | 前端 | **已实现骨架** Vue 3 + Vite + TypeScript | Element Plus；Vitest + jsdom；业务页在 #13–#15 |
 | 认证 | **已实现** 单口令 + 会话 cookie | 口令存 `ADMIN_PASSWORD`，缺失则启动失败；会话服务端登记，退出即可撤销。会话存内存（重启失效），多进程需换共享存储 |
-| 接口层 | **已实现** FastAPI | 认证、答卷导入、批量任务、复核（队列/详情/改分/批量通过）、评分标准（生成/迭代/保存/列表/按版本打开）；管理端骨架已就绪（#12），业务页待 #13–#15 |
+| 接口层 | **已实现** FastAPI | 认证、答卷导入、批量任务、复核（队列/详情/改分/批量通过）、评分标准（生成/迭代/保存/列表/按版本打开/实时校验）；管理端骨架已就绪（#12），业务页待 #13–#15 |
 | 部署 | 待定 | 本地演示优先 |
 | 最高档分值是否必须等于权重 | 待定 | 目前只作为 `TOP_LEVEL_BELOW_WEIGHT` **提示**，不拦保存。加硬校验会让"按权重算分"名副其实，但会约束评分标准的写法 |
 

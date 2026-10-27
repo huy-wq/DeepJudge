@@ -263,6 +263,51 @@ class InlineEdit(RubricApiTestCase):
         self.assertIn("SCORE_OUT_OF_RANGE", codes)
 
 
+class Validate(RubricApiTestCase):
+    def test_a_valid_draft_is_usable_and_has_no_issues(self):
+        response = self.client.post("/api/rubrics/validate", json={"rubric": RUBRIC_DATA})
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"usable": True, "issues": []})
+
+    def test_blocking_problems_are_reported_and_keep_the_draft_unusable(self):
+        response = self.client.post(
+            "/api/rubrics/validate",
+            json={"rubric": rubric_variant(_items={"P1": {"weight": 4}})},
+        )
+
+        body = response.json()
+        self.assertFalse(body["usable"])
+        weight_issue = next(issue for issue in body["issues"] if issue["code"] == "WEIGHT_SUM")
+        self.assertTrue(weight_issue["blocking"])
+        self.assertIn("超出", weight_issue["message"])
+
+    def test_semantic_warnings_do_not_block_the_draft(self):
+        rubric = rubric_variant()
+        rubric["items"][0]["levels"][1]["criterion"] = "论述充分即可"
+        response = self.client.post("/api/rubrics/validate", json={"rubric": rubric})
+
+        body = response.json()
+        self.assertTrue(body["usable"])
+        warning = next(
+            issue for issue in body["issues"] if issue["code"] == "VAGUE_CRITERION"
+        )
+        self.assertFalse(warning["blocking"])
+
+    def test_validation_does_not_write_anything(self):
+        self.client.post("/api/rubrics/validate", json={"rubric": RUBRIC_DATA})
+        self.assertEqual(self.client.get("/api/rubrics").json()["total"], 0)
+
+    def test_validation_requires_login(self):
+        self.client.cookies.clear()
+        response = self.client.post("/api/rubrics/validate", json={"rubric": RUBRIC_DATA})
+        self.assertEqual(response.status_code, 401)
+
+    def test_validation_rejects_a_malformed_body(self):
+        response = self.client.post("/api/rubrics/validate", json={"rubric": "not-an-object"})
+        self.assertEqual(response.status_code, 422)
+
+
 class Generate(RubricApiTestCase):
     def test_generate_returns_the_three_views_and_the_draft(self):
         response = self.generate()

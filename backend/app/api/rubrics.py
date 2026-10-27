@@ -22,7 +22,12 @@ from ..providers.base import GradingProvider
 from ..rubric_gen import describe_changes, generate_rubric
 from ..store import RubricNotFound, Store
 from .deps import require_admin, require_store
-from .schemas import GenerateRubricRequest, IterateRubricRequest, SaveRubricRequest
+from .schemas import (
+    GenerateRubricRequest,
+    IterateRubricRequest,
+    SaveRubricRequest,
+    ValidateRubricRequest,
+)
 
 
 def _document(record: dict[str, Any]) -> dict:
@@ -147,6 +152,19 @@ def register(app: FastAPI) -> None:
             "question_code": record["question_code"],
         }
         return body
+
+    @app.post("/api/rubrics/validate", dependencies=[Depends(require_admin)])
+    def validate_rubric(payload: ValidateRubricRequest) -> dict:
+        """实时校验编辑中的标准。
+
+        编辑页不复制一份校验规则：每次改动（防抖后）都来问服务端，阻断项与提示项
+        与保存时完全同一套判断。**不需要数据库**，也不会写入任何东西。
+        """
+        parsed = parse(payload.rubric)
+        return {
+            "usable": parsed.usable,
+            "issues": [issue.to_dict() for issue in parsed.issues],
+        }
 
     @app.post("/api/rubrics", dependencies=[Depends(require_admin)])
     def create_rubric(

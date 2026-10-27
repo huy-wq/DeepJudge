@@ -83,3 +83,7 @@ class SaveRubricRequest(BaseModel):
     rubric: dict[str, Any] = Field(description="完整的结构化评分标准")
     source_text: str = Field(default="", description="教师原话；编辑已有标准时可省略")
     feedback: str = Field(default="", description="这一版是怎么改出来的")
+
+
+class ValidateRubricRequest(BaseModel):
+    rubric: dict[str, Any] = Field(description="待校验的结构化评分标准（可不落库）")

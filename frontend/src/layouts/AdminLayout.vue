@@ -31,6 +31,7 @@ async function handleLogout(): Promise<void> {
       <span class="brand">DeepJudge</span>
       <nav class="nav">
         <router-link to="/" data-test="nav-home">首页</router-link>
+        <router-link to="/rubrics" data-test="nav-rubrics">评分标准</router-link>
       </nav>
       <span class="spacer" />
       <el-button text :loading="leaving" data-test="logout" @click="handleLogout">
@@ -65,6 +66,11 @@ async function handleLogout(): Promise<void> {
   font-weight: 600;
   font-size: 18px;
   letter-spacing: 0.02em;
+}
+
+.nav {
+  display: flex;
+  gap: 16px;
 }
 
 .nav a {

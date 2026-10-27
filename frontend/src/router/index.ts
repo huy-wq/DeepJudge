@@ -40,6 +40,22 @@ export const routes: RouteRecordRaw[] = [
         name: 'home',
         component: () => import('../views/HomeView.vue'),
       },
+      {
+        path: 'rubrics',
+        name: 'rubrics',
+        component: () => import('../views/RubricListView.vue'),
+      },
+      {
+        path: 'rubrics/new',
+        name: 'rubric-new',
+        component: () => import('../views/RubricEditorView.vue'),
+      },
+      {
+        // 数字 id 才走编辑页，避免与 /rubrics/new 抢路由
+        path: 'rubrics/:id(\\d+)',
+        name: 'rubric-edit',
+        component: () => import('../views/RubricEditorView.vue'),
+      },
     ],
   },
   {
