@@ -6,30 +6,23 @@
 import json
 import unittest
 
+from app.core.rubric import from_dict
 from app.providers.fake import CannedProvider
 from app.rubric_gen import (
     RubricGenerationError,
     build_generation_messages,
+    build_iteration_messages,
+    describe_changes,
     generate_rubric,
     preview_rows,
 )
-from tests.fixtures import RUBRIC_DATA
+from tests.fixtures import RUBRIC_DATA, generation_payload
 
 STEM = "简述 TCP 三次握手的过程，并说明其目的。"
 STANDARD_TEXT = (
     "三个要点：客户端发 SYN 与初始序列号给 3 分；服务器回 SYN+ACK 给 4 分；"
     "客户端再回 ACK 给 3 分。把三次握手说成四次挥手扣 2 分。"
 )
-
-
-def generation_payload(**overrides) -> str:
-    data = {
-        "summary": "本题按三次握手的三个步骤拆成三个采分点，另设一个混淆扣分项。",
-        "items": json.loads(json.dumps(RUBRIC_DATA["items"])),
-        "deductions": json.loads(json.dumps(RUBRIC_DATA["deductions"])),
-    }
-    data.update(overrides)
-    return json.dumps(data, ensure_ascii=False)
 
 
 class RecordingProvider:
@@ -295,6 +288,114 @@ class ModelCannotChangeScoringBehaviour(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("3 分未分配", message)
         self.assertIn("缺少必填字段", message)
+
+
+
+
+class IterationPrompt(unittest.TestCase):
+    def setUp(self):
+        self.previous = from_dict(RUBRIC_DATA)
+        self.messages = build_iteration_messages(
+            previous=self.previous, feedback="P3 拆得太粗，拆成两个采分点"
+        )
+
+    def test_only_the_pointed_part_should_change(self):
+        system = self.messages[0]["content"]
+        self.assertIn("只改", system)
+        self.assertIn("保持不变", system)
+
+    def test_previous_version_is_carried_as_data(self):
+        content = self.messages[1]["content"]
+        self.assertIn("<previous>", content)
+        self.assertIn('"id": "P2"', content)
+        self.assertIn("服务器回复 SYN+ACK", content)
+
+    def test_feedback_is_tagged_and_last(self):
+        content = self.messages[1]["content"]
+        self.assertIn("<feedback>", content)
+        self.assertIn("P3 拆得太粗", content)
+        self.assertTrue(content.rstrip().endswith("输出修改后的完整 JSON。"))
+
+
+class GenerateIteration(unittest.TestCase):
+    def setUp(self):
+        self.previous = from_dict(RUBRIC_DATA)
+
+    def test_iteration_never_needs_the_original_teacher_words(self):
+        provider = CannedProvider([generation_payload()])
+
+        result = generate_rubric(
+            provider,
+            previous=self.previous,
+            feedback="P1 的描述再具体一点",
+        )
+
+        self.assertEqual(result.attempts, 1)
+        self.assertEqual(result.rubric, self.previous)
+        # 题干、满分、题号、参考答案一律沿用上一版，模型改不动
+        self.assertEqual(result.rubric.question_id, "Q-01")
+        self.assertEqual(result.rubric.stem, self.previous.stem)
+        self.assertEqual(result.rubric.total_score, 10)
+
+    def test_iteration_requires_feedback(self):
+        with self.assertRaises(ValueError):
+            generate_rubric(
+                CannedProvider([generation_payload()]),
+                previous=self.previous,
+                feedback="   ",
+            )
+
+    def test_model_cannot_change_server_owned_fields_during_iteration(self):
+        provider = CannedProvider(
+            [generation_payload(question_id="HACK", total_score=5, stem="模型改的题干")]
+        )
+
+        result = generate_rubric(
+            provider, previous=self.previous, feedback="只改 P2 的措辞"
+        )
+
+        self.assertEqual(result.rubric.question_id, "Q-01")
+        self.assertEqual(result.rubric.total_score, 10)
+        self.assertEqual(result.rubric.stem, self.previous.stem)
+
+
+class ChangeSummary(unittest.TestCase):
+    def setUp(self):
+        self.previous = from_dict(RUBRIC_DATA)
+
+    def test_identical_versions_have_no_changes(self):
+        self.assertEqual(describe_changes(self.previous, from_dict(RUBRIC_DATA)), [])
+
+    def test_changed_description_is_named_with_its_field(self):
+        changed = from_dict(RUBRIC_DATA)
+        changed.items[0].desc = "客户端发送 SYN，并给出初始序列号"
+
+        changes = describe_changes(self.previous, changed)
+
+        self.assertEqual(
+            changes,
+            [{"id": "P1", "type": "item", "change": "updated", "fields": ["desc"]}],
+        )
+
+    def test_weight_and_levels_are_reported_separately(self):
+        changed = from_dict(RUBRIC_DATA)
+        changed.items[1].weight = 5
+        changed.items[1].levels = changed.items[1].levels[:2]
+
+        changes = describe_changes(self.previous, changed)
+
+        self.assertEqual(changes[0]["id"], "P2")
+        self.assertCountEqual(changes[0]["fields"], ["weight", "levels"])
+
+    def test_added_and_removed_points_are_reported(self):
+        changed = from_dict(RUBRIC_DATA)
+        changed.items = changed.items[:2]  # 去掉 P3
+
+        changes = describe_changes(self.previous, changed)
+
+        self.assertEqual(
+            changes, [{"id": "P3", "type": "item", "change": "removed"}]
+        )
 
 
 if __name__ == "__main__":

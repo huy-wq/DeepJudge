@@ -21,6 +21,7 @@ from .api import errors
 from .api import register as register_auth
 from .api.answers import register as register_answers
 from .api.results import register as register_results
+from .api.rubrics import register as register_rubrics
 from .api.tasks import register as register_tasks
 from .auth import SESSION_TTL_SECONDS, AdminAuth
 from .providers.base import GradingProvider, ProviderError
@@ -87,6 +88,8 @@ def create_app(
     app = FastAPI(title="DeepJudge", version="0.1.0", lifespan=lifespan)
     app.state.auth = auth
     app.state.store = store
+    # 标准生成接口要用它；批量任务用同一个工厂，两个入口共享一份配置
+    app.state.provider_factory = factory
     app.state.runner = (
         TaskRunner(store, factory, concurrency=concurrency_from_env()) if store else None
     )
@@ -96,6 +99,7 @@ def create_app(
     register_answers(app)
     register_tasks(app)
     register_results(app)
+    register_rubrics(app)
     return app
 
 

@@ -36,6 +36,10 @@ class RubricIssue:
     def __str__(self) -> str:
         return self.message
 
+    def to_dict(self) -> dict[str, Any]:
+        """接口与脚本共用的形状：稳定 code + 给人看的 message + 是否拦保存。"""
+        return {"code": self.code, "message": self.message, "blocking": self.blocking}
+
 
 def _error(code: str, message: str) -> RubricIssue:
     return RubricIssue(code=code, message=message, blocking=True)

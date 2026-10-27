@@ -186,6 +186,44 @@ python3 scripts/gen_rubric.py --stem "简述 TCP 三次握手的过程，并说�
 **校验清单**（权重和、等级依据）。校验清单分两类：**阻断保存**的结构错误与**仅提示**的语义问题。
 模型漏了采分点时只会报"还有 N 分未分配"，不会替你补点。
 
+**走接口：生成 → 保存 → 改一行 / 带意见重来**
+
+```bash
+# 1. 生成草稿（不落库）：返回摘要、预览表、校验清单与结构化标准
+curl -s -b /tmp/c.txt -X POST http://127.0.0.1:8000/api/rubrics/generate \
+  -H 'content-type: application/json' \
+  -d '{"stem":"简述 TCP 三次握手的过程，并说明其目的。","total_score":10,"standard_text":"三个要点：客户端发 SYN 给 3 分；服务器回 SYN+ACK 给 4 分；客户端回 ACK 给 3 分。"}'
+
+# 2. 确认后保存：整份提交；结构错误会被逐条拒绝（issues 里带 P1 / D1）
+python3 -c 'import json;print(json.dumps({"rubric":json.load(open("data/samples/tcp-handshake/rubric.json")),"source_text":"三个要点……"}))' \
+  | curl -s -b /tmp/c.txt -X POST http://127.0.0.1:8000/api/rubrics \
+    -H 'content-type: application/json' --data-binary @-
+
+# 3. 列表（每题只给最新一版）与按版本打开（含当时的教师原话与修改意见）
+curl -s -b /tmp/c.txt http://127.0.0.1:8000/api/rubrics
+curl -s -b /tmp/c.txt http://127.0.0.1:8000/api/rubrics/1
+
+# 4. 行内编辑：改一行后整份提交，追加一版，旧版原样保留
+python3 - <<'PY' > /tmp/edited-rubric.json
+import json
+rubric = json.load(open("data/samples/tcp-handshake/rubric.json"))
+rubric["items"][0]["desc"] = "客户端发送 SYN，并给出初始序列号"
+print(json.dumps({"rubric": rubric, "feedback": "P1 描述写具体"}))
+PY
+curl -s -b /tmp/c.txt -X PUT http://127.0.0.1:8000/api/rubrics/1 \
+  -H 'content-type: application/json' --data-binary @/tmp/edited-rubric.json
+
+# 5. 带上一版 + 一条意见重新生成：上一版整份进提示词，模型只该动被指出的部分
+curl -s -b /tmp/c.txt -X POST http://127.0.0.1:8000/api/rubrics/1/iterate \
+  -H 'content-type: application/json' -d '{"feedback":"P3 拆得太粗，拆成两个采分点"}'
+```
+
+迭代响应里的 `changes` 是服务端算出的差异清单（哪个点新增/删除/改了哪些字段），
+用来看模型有没有顺手动了别处。确认后对响应里的 `based_on.rubric_id` 发 `PUT`
+（而不是 `POST`）保存，新版本才会记下"改自哪一版"。
+
+保存只追加版本，旧版永远能按 id 打开；已经建好的评分任务仍指向它启动时那一版。
+
 **跑一次评分并把结果落库**
 
 ```bash

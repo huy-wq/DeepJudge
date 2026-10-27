@@ -11,13 +11,21 @@ from fastapi.responses import JSONResponse
 
 from fastapi.exceptions import RequestValidationError
 
+from ..core.rubric import RubricError
+from ..providers.base import ProviderError
+from ..rubric_gen import RubricGenerationError
 from ..store import (
     QuestionNotFound,
     ResultFinalized,
     ResultNotFound,
     ResultSuperseded,
     ReviewRejected,
+    RubricNotFound,
 )
+
+
+def _issues(issues) -> list[dict]:
+    return [issue.to_dict() for issue in issues]
 
 
 def register(app: FastAPI) -> None:
@@ -60,6 +68,50 @@ def register(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"detail": str(exc), "code": "REVIEW_REJECTED"},
+        )
+
+    @app.exception_handler(RubricNotFound)
+    async def _rubric_not_found(request: Request, exc: RubricNotFound):
+        del request
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": str(exc), "code": "RUBRIC_NOT_FOUND"},
+        )
+
+    @app.exception_handler(RubricError)
+    async def _rubric_invalid(request: Request, exc: RubricError):
+        del request
+        # 附带逐条问题：前端要能定位到某个采分点，而不是只看到"不合法"
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "detail": "评分标准不合法",
+                "code": "RUBRIC_INVALID",
+                "issues": _issues(exc.issues),
+            },
+        )
+
+    @app.exception_handler(RubricGenerationError)
+    async def _rubric_generation_failed(request: Request, exc: RubricGenerationError):
+        del request
+        # 422：模型连试两次仍给不出合法标准，问题在模型输出，不在请求格式
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": str(exc),
+                "code": "RUBRIC_GENERATION_FAILED",
+                "attempts": exc.attempts,
+                "issues": _issues(exc.issues),
+            },
+        )
+
+    @app.exception_handler(ProviderError)
+    async def _provider_error(request: Request, exc: ProviderError):
+        del request
+        # 502：上游模型不可用。code 原样带回（MISSING_API_KEY / RATE_LIMITED …）
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={"detail": str(exc), "code": exc.code or "PROVIDER_ERROR"},
         )
 
     @app.exception_handler(RequestValidationError)

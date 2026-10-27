@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from sqlalchemy import (
     JSON,
+    text,
     Boolean,
     Column,
     DateTime,
@@ -70,6 +71,30 @@ rubrics = Table(
     Column("version", Integer, nullable=False),
     Column("schema_json", JSON, nullable=False, comment="当时的标准全文，只增不改"),
     Column("checksum", String(64), nullable=False, comment="schema_json 的 sha256"),
+    Column(
+        "source_text",
+        LongText,
+        nullable=False,
+        # MySQL 8 的 TEXT 不能写 `DEFAULT ''`，只接受表达式默认值 `DEFAULT ('')`；
+        # SQLite 同样接受括号写法。写裸字符串会让建库在 MySQL 上直接失败。
+        server_default=text("('')"),
+        comment="教师口述的评分标准原文：这一版是怎么来的",
+    ),
+    Column(
+        "feedback",
+        LongText,
+        nullable=False,
+        server_default=text("('')"),
+        comment="生成这一版时的修改意见；空串表示首次保存或手工编辑",
+    ),
+    Column(
+        "parent_rubric_id",
+        Integer,
+        nullable=True,
+        # 故意不加自引用外键：标准只增不删，父版本不可能消失；
+        # 而 SQLite 上加外键要重建整张表，代价不值得。
+        comment="这一版是从哪一版改出来的；首次保存为空",
+    ),
     Column("created_at", DateTime, nullable=False, server_default=func.now()),
     UniqueConstraint("question_id", "version", name="uq_rubrics_question_version"),
     Index("ix_rubrics_question_created", "question_id", "created_at"),

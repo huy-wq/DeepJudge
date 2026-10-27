@@ -125,6 +125,7 @@ backend/
 │   │   ├── answers.py        # 答卷导入：预览与入库
 │   │   ├── tasks.py          # 批量任务：创建 / 进度 / 重试
 │   │   ├── results.py        # 复核：待复核队列 / 详情 / 改分 / 批量通过
+│   │   ├── rubrics.py        # 标准：生成 / 带意见迭代 / 保存 / 列表 / 按版本打开
 │   │   ├── deps.py           # 认证依赖（401）与数据库依赖（503）
 │   │   ├── errors.py         # 领域异常 → 状态码；422 不回显请求内容
 │   │   └── schemas.py        # 请求响应模型（pydantic）
@@ -246,7 +247,8 @@ backend/
 
 ```text
 questions(id, code, stem, type, total_score, status, created_at)
-rubrics(id, question_id, version, schema_json, checksum, created_at)
+rubrics(id, question_id, version, schema_json, checksum, source_text, feedback,
+        parent_rubric_id, created_at)
 answers(id, question_id, student_pseudo_id, raw_text, normalized_text, content_hash, source, truncated, created_at)
 grading_runs(id, answer_id, rubric_id, prompt_version, model, params_json, status,
              score, comment, tokens_in, tokens_out, latency_ms, error, created_at)
@@ -269,7 +271,11 @@ calibration_models(id, version, method, params_json, train_size, metrics_json, c
 | --- | --- |
 | `questions.code` 存业务编号（`Q-01`），其余表用整型外键 | 人能读的编号与数据库主键分开，改编号不会牵动全库 |
 | `grading_runs.rubric_id` 指向不可变快照，不再存 `rubric_version` | 版本号存两处必然漂移；外键指过去，版本号 join 出来 |
-| `rubrics` 只增不改，`checksum` 是 `schema_json` 的 sha256 | 内容没变就复用最新一版；变了追加一版。旧运行永远显示当时的标准 |
+| `rubrics` 的内容只增不改，`checksum` 是 `schema_json` 的 sha256 | 内容没变就复用最新一版；变了追加一版。旧运行永远显示当时的标准。溯源列只补空值，不改写内容 |
+| `rubrics.source_text` / `feedback` 记录这一版怎么来的 | 首次保存写教师原话，迭代写那条意见，手工编辑为空串。没有它们，"这个权重怎么来的"只能翻聊天记录（§5.6） |
+| `rubrics.parent_rubric_id` 记录这一版改自哪一版 | 版本号只说明先后，不说明来源；改旧版再存时两者会不一致。自引用字段**不加外键**：标准只增不删，父版本不会消失，而 SQLite 加外键要重建整表 |
+| 复用同内容版本时只**补空**的溯源 | 评分写入路径可能先建过同一内容、却没带原话；这次保存把空着的 `source_text`/`feedback` 补上，不覆盖已有记录 |
+| 保存标准时同步 `questions.stem` / `total_score` | 标准里存一份、题目表里存一份（列表页要读）。只创建不更新会留下"标准说 12 分、题目说 10 分"两套真相 |
 | `item_results.kind` 区分 `item` / `deduction`，`level` 可空 | 扣分项没有等级、只有命中与否，硬塞进同一个字段会造出"扣分项等级 0"这种假数据 |
 | 分值统一 `DOUBLE` 且 `asdecimal=False` | 否则 MySQL 回来是 `Decimal`、SQLite 回来是 `float`，同一份结果两副面孔 |
 | 所有表 `utf8mb4` + `InnoDB` | 唯一能完整存下 emoji 的字符集；中文不需要特殊照顾，不需要照顾的才不容易坏 |
@@ -332,6 +338,12 @@ system 中的三条硬纪律：
 服务端校验：schema 合法性、id 唯一、`Σweight == total_score`、等级分值域、等级单调。
 不合法 → 带上错误信息重试 1 次 → 仍失败则回显错误、不落库（**不静默保存半成品**）。
 
+**迭代生成**（`POST /api/rubrics/{id}/iterate`）复用同一套校验与重试，只换提示词：
+上一版**整份** JSON 与一条修改意见一起进 `<previous>` / `<feedback>` 标签，system 明确
+"只改教师指出的部分，其余保持不变"。题号、题干、满分、参考答案与 `rules` 仍由服务端保留——
+模型改了也会被丢弃。**上一版必须整份带上**，否则它会当成"重新生成"，教师确认过的权重与等级
+会整个漂移（§5.4）。
+
 ### 5.3 确认（三视图，缺一不可）
 
 | 视图 | 回答的问题 |
@@ -367,7 +379,16 @@ system 中的三条硬纪律：
 两条路并存，缺一不可：
 
 - **迭代生成**：带上上一版 JSON + 教师的修改意见（"P3 拆得太粗"），只改指定部分。
+  接口是 `POST /api/rubrics/{id}/iterate`。
 - **行内编辑**：直接在预览表上改某一行（权重、描述、等级分值）。
+  接口是 `PUT /api/rubrics/{id}`：整份提交，服务端校验后**追加一版**，旧版原样保留。
+
+迭代响应附带服务端算出的**变更清单**（哪些采分点新增 / 删除 / 改了哪个字段）。模型能不能
+"只改被指出的部分"无法由代码强制，但差异必须当场可见——否则教师得逐行比对两份标准，
+才能发现模型顺手动了别处。
+
+迭代得到的是**草稿**，保存时用 `PUT /api/rubrics/{based_on.rubric_id}`（而不是 `POST`），
+新版本的 `parent_rubric_id` 才会指向上一版；否则版本号只说明先后，说明不了来源。
 
 "彻底重来"作为独立按钮保留，但默认不用。**如果只能靠重新生成，教师会被模型绑架**——改一句话，整份结构全变，之前确认过的部分也没了。
 
@@ -383,6 +404,14 @@ system 中的三条硬纪律：
 ### 5.6 留档
 
 教师原话与历次修改意见都存，作为"采分点为什么这么拆"的来源证据。答辩被问"这个权重怎么来的"，要能翻出原文。
+
+落地为 `rubrics` 的三列：`source_text`（这一版依据的教师原话）、`feedback`（生成这一版时
+的修改意见）与 `parent_rubric_id`（改自哪一版）。它们跟着版本走——同一道题的每一版都有自己的
+来源，而不是只在题目上记一份。
+
+**首次保存强制要求原话**（`POST /api/rubrics` 缺 `source_text` 返回 400 `SOURCE_TEXT_REQUIRED`）；
+**行内编辑**没重发原话时沿用上一版的 `source_text`，不会因为"改一行"把教师原话抹掉。
+若同一内容早已被评分路径写入（没有原话），这次保存会把空着的溯源补上，但**不覆盖**已有记录。
 
 ### 5.7 答卷从哪来
 
@@ -517,7 +546,7 @@ system 中的三条硬纪律：
 | 任务执行 | **已实现** 进程内线程池 | `GRADING_CONCURRENCY`（默认 2，上限 4）。重启时把 running 任务标为 interrupted 并可重试；多 worker 部署需换共享队列 |
 | 前端 | **已定** Vue 3 | 组件库待定；复核界面是必需项 |
 | 认证 | **已实现** 单口令 + 会话 cookie | 口令存 `ADMIN_PASSWORD`，缺失则启动失败；会话服务端登记，退出即可撤销。会话存内存（重启失效），多进程需换共享存储 |
-| 接口层 | **已实现** FastAPI | 认证、答卷导入、批量任务、复核（队列/详情/改分/批量通过）；评分标准的保存接口待 #11 |
+| 接口层 | **已实现** FastAPI | 认证、答卷导入、批量任务、复核（队列/详情/改分/批量通过）、评分标准（生成/迭代/保存/列表/按版本打开）；前端待 #12–#15 |
 | 部署 | 待定 | 本地演示优先 |
 | 最高档分值是否必须等于权重 | 待定 | 目前只作为 `TOP_LEVEL_BELOW_WEIGHT` **提示**，不拦保存。加硬校验会让"按权重算分"名副其实，但会约束评分标准的写法 |
 

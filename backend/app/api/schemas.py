@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -64,3 +64,22 @@ class ReviewRequest(BaseModel):
 class BatchAcceptRequest(BaseModel):
     aggregate_ids: list[int] = Field(min_length=1, description="要批量通过的评分结果编号")
     comment: str = Field(default="", description="整批共用的说明")
+
+
+# ---------------------------------------------------------------- 评分标准
+class GenerateRubricRequest(BaseModel):
+    stem: str = Field(default="", description="题干")
+    total_score: float | None = Field(default=None, description="满分")
+    standard_text: str = Field(default="", description="教师口述的评分标准原文")
+    reference_answer: str = Field(default="", description="参考答案，可空")
+    question_id: str = Field(default="Q-01", description="题号，默认 Q-01")
+
+
+class IterateRubricRequest(BaseModel):
+    feedback: str = Field(default="", description="一条修改意见：只改这里指出的部分")
+
+
+class SaveRubricRequest(BaseModel):
+    rubric: dict[str, Any] = Field(description="完整的结构化评分标准")
+    source_text: str = Field(default="", description="教师原话；编辑已有标准时可省略")
+    feedback: str = Field(default="", description="这一版是怎么改出来的")

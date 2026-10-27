@@ -6,9 +6,9 @@
 >
 > 若两者冲突，以 `docs/architecture.md` 为准；发现冲突请改本文件。
 
-**当前状态**：269 个测试通过（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
+**当前状态**：309 个测试通过（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
 裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归），约 12000 行（含文档与测试）。
-已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成。
+已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成、#11 标准保存与迭代。
 **没有**的部分见 §8，别在代码里找不存在的东西。
 
 ---
@@ -46,7 +46,7 @@ backend/
 │   ├── cli.py           ← 命令行入口与报告组装
 │   └── config.py        ← .env 读取
 ├── migrations/          ← Alembic 迁移（表结构的部署真源）
-├── tests/               ← 269 个用例
+├── tests/               ← 309 个用例
 └── scripts/             ← 实验脚本（backend/scripts，如方差实测）
 
 仓库根目录还有：docker-compose.yml（本地 MySQL 8）、scripts/dev-db.sh（一键起库 + 迁移）。
@@ -60,14 +60,15 @@ backend/
 | `core/prompt.py` | 81 | 仅标准库 | ④ |
 | `providers/` | 174 | 标准库 `urllib`（不装 SDK） | ⑤ |
 | `pipeline.py` | 154 | core + providers | ⑥ |
-| `rubric_gen.py` | 257 | core + providers | ⑥′（与评分并列的另一条主线） |
+| `rubric_gen.py` | 428 | core + providers | ⑥′（与评分并列的另一条主线） |
 | `core/aggregate.py` + `core/routing.py` | 194 | 仅标准库 | ⑦ |
-| `store/` | 1665 | SQLAlchemy | ⑧ |
+| `store/` | 1903 | SQLAlchemy | ⑧ |
 | `cli.py` | 206 | 全部 | ⑨ |
 | `auth.py` + `api/` + `main.py` | 约 1000 | FastAPI | ⑩（另一条主线：HTTP 入口） |
 | `importing.py` | 260 | 仅标准库 + core | ⑪（答卷怎么进来） |
 | `tasks.py` | 190 | core + providers + store | ⑫（怎么批量评） |
 | `api/results.py` | 264 | FastAPI + store | ⑬（复核队列与定稿） |
+| `api/rubrics.py` | 189 | FastAPI + store + rubric_gen | ⑭（标准的保存与迭代） |
 
 **依赖方向是硬约束，不是风格建议。** 可以用一条命令自己验：
 
@@ -92,7 +93,7 @@ cd backend && grep -h "^import \|^from " app/core/*.py | grep -v "^from \." | so
 | 5 | 解析 + 证据接地 | `core/json_extract.py:31` `extract_payload`、`pipeline.py:41` `_parse_items`、`core/grounding.py:92` `apply_grounding` | ✅ |
 | 6 | 多采样聚合 | `core/aggregate.py:67` `aggregate` | ✅ |
 | 7 | 服务端算分 | `core/aggregate.py:39` `sample_score`（**唯一算分入口**） | ✅ |
-| 8 | 路由 + 落库 | `core/routing.py:34` `decide`、`store/repository.py:162` `save_evaluation` | ✅ |
+| 8 | 路由 + 落库 | `core/routing.py:34` `decide`、`store/repository.py:336` `save_evaluation` | ✅ |
 
 > 八步之外还有一条更上游的线：**先有标准，才谈得上评分**。
 > 教师的一段口述怎么变成这份 rubric，看 `app/rubric_gen.py`（见 §2 ⑥′）。
@@ -450,14 +451,17 @@ print('模型说 99，服务端算出：', r.score)
 
 | 位置 | 在干什么 | 读的时候注意 |
 | --- | --- | --- |
-| `:29` `MAX_ATTEMPTS` | 重试上限 2（原调用 + 1 次） | 与"自动重试一次"的验收一致，不要调大 |
-| `:31` `GEN_SYSTEM` | 六条纪律 | 第 1 条是核心：**不得新增教师未提及的采分点** |
-| `:61` `GeneratedRubric`（`views()` 在 `:74`） | 成功结果：标准 + 摘要 + 提示项 + 尝试次数 + 原始输出 | `views()` 一次给全三视图；`issues` 里只剩仅提示项（阻断项会让它抛错） |
-| `:92` `RubricGenerationError` | 重试后仍失败 | 带 `issues`（给教师看）与 `responses`（给排查用） |
-| `:118` `build_generation_messages` | 组装提示词 | 教师原话放最后、用 `<standard>` 包住 |
-| `:142` `preview_rows` | 预览表 | 纯数据整形，给前端渲染表格 |
-| `:163` `generate_rubric` | 主循环：调模型 → 校验 → 不合法就带上错误重试 | 见下面第 3 条 |
-| `:229` `_with_server_owned_fields` | **服务端改写题目信息** | 模型给的 `total_score`/`stem`/`question_id` 一律丢弃 |
+| `:30` `MAX_ATTEMPTS` | 重试上限 2（原调用 + 1 次） | 与"自动重试一次"的验收一致，不要调大 |
+| `:32` `GEN_SYSTEM` | 六条纪律 | 第 1 条是核心：**不得新增教师未提及的采分点** |
+| `:44` `ITER_SYSTEM` | 迭代的额外纪律 | 只改教师指出的部分，其余采分点保持不变 |
+| `:73` `GeneratedRubric`（`views()` 在 `:86`） | 成功结果：标准 + 摘要 + 提示项 + 尝试次数 + 原始输出 | `views()` 一次给全三视图；`issues` 里只剩仅提示项（阻断项会让它抛错） |
+| `:101` `RubricGenerationError` | 重试后仍失败 | 带 `issues`（给教师看）与 `responses`（给排查用） |
+| `:127` `build_generation_messages` | 首次生成的提示词 | 教师原话放最后、用 `<standard>` 包住 |
+| `:151` `build_iteration_messages` | 迭代提示词 | 上一版**整份** JSON 进 `<previous>`，意见进 `<feedback>`；少了整份就会退化成重新生成 |
+| `:173` `preview_rows` | 预览表 | 纯数据整形，给前端渲染表格 |
+| `:194` `describe_changes` | 迭代前后差在哪 | 服务端 diff：模型"只改指出的部分"无法强制，但差异必须当场可见 |
+| `:265` `generate_rubric` | 主循环：调模型 → 校验 → 不合法就带上错误重试 | `previous` 非空走迭代分支，见下面第 4 条 |
+| `:347` `_with_server_owned_fields` | **服务端改写题目信息** | 模型给的 `total_score`/`stem`/`question_id` 一律丢弃；迭代时 `rules` 也沿用上一版 |
 
 **三处必须看出来的设计**：
 
@@ -476,6 +480,11 @@ print('模型说 99，服务端算出：', r.score)
 3. **重试不是"再来一次"，是"带着错误再来一次"。**
    `generate_rubric` 把上一轮模型原话作为 `assistant` 消息、把问题清单作为新的 `user` 消息追加上去，
    并在里面**明确禁止补点**。没有这一步，模型会原地重复同一个错误。
+
+4. **迭代只换提示词，不换规则。**
+   首次生成与迭代共用同一个重试环与同一套服务端校验；区别只在 `build_iteration_messages`
+   把上一版整份带进去，且题号 / 题干 / 满分 / 参考答案 / `rules` 全部取自上一版。
+   教师的"改一句"因此不会把整份结构重洗（架构 §5.4）。
 
 **动手验证**（离线，不花钱）：
 
@@ -697,7 +706,7 @@ curl -s -b /tmp/c.txt http://127.0.0.1:8000/api/auth/session
    测试 `test_broken_rows_never_echo_the_original_line` 钉住它。
 
 3. **脱敏编号与学号无关。**
-   `S-0001` 是按题号顺序生成的序号（`store/repository.py:384` `import_answers`），
+   `S-0001` 是按题号顺序生成的序号（`store/repository.py:844` `import_answers`），
    与真实的 2024001 没有任何对应关系——否则"脱敏"只是换了个字段名。
 
 **动手验证**（真库 + 真 HTTP，SQLite 即可）：
@@ -736,10 +745,10 @@ curl -s -b /tmp/c.txt -X POST localhost:8000/api/answers/preview \
 | `:96` `_process` | 起 N 个 worker，各自循环领取 | 不是"一次抢光再提交"——`running` 才真的代表"正在评" |
 | `:116` `_grade_one` | 评一份：取答卷 → 取标准快照 → `evaluate` → 落库 | 所有异常都在这层被吃成 `failed`，绝不冒泡 |
 | `:83` `_run` | 任务级收尾 | **必须有 except**：执行器自己崩了也要把任务标成 `interrupted` 并记原因，否则它永远停在 running |
-| `app/store/repository.py:819` `claim_next_item` | **CAS** 领取：带 `status='pending'` 条件更新 | 先读后写会有一份答卷被评两次（本票踩过） |
-| `repository.py:816` `create_task` | 建任务 + 固定 `rubric_id` | 任务级快照：之后改标准不影响这批 |
-| `repository.py:1037` `task_item_views` | 进度查询（含 `score`、`route`、`final_score`、`current`） | "待复核"/"已定稿"/"已过期"由 `route`、复核记录、`current` 派生，不另存 |
-| `repository.py:1144` `mark_interrupted_tasks` | 启动时清理上次的 running | 没有它，崩溃后任务永远显示"进行中" |
+| `app/store/repository.py:1119` `claim_next_item` | **CAS** 领取：带 `status='pending'` 条件更新 | 先读后写会有一份答卷被评两次（本票踩过） |
+| `repository.py:1044` `create_task` | 建任务 + 固定 `rubric_id` | 任务级快照：之后改标准不影响这批 |
+| `repository.py:1265` `task_item_views` | 进度查询（含 `score`、`route`、`final_score`、`current`） | "待复核"/"已定稿"/"已过期"由 `route`、复核记录、`current` 派生，不另存 |
+| `repository.py:1372` `mark_interrupted_tasks` | 启动时清理上次的 running | 没有它，崩溃后任务永远显示"进行中" |
 | `app/api/tasks.py:54` `POST /api/tasks` | 建任务并 `runner.start` | 参数校验：答卷必须属于该题 |
 | `:75` `POST /api/tasks/{id}/retry` | 只把失败项放回 pending | 可传 `answer_ids` 只重试指定几份 |
 
@@ -779,18 +788,18 @@ python3 -m unittest tests.test_api_tasks -v      # 9 个用例，HTTP 层
 
 | 位置 | 在干什么 | 读的时候注意 |
 | --- | --- | --- |
-| `repository.py:1211` `list_results` | 待复核队列 | 只列每份答卷**最新**的聚合结果；`pending=false` 时反过来列全部定稿历史，不套"最新"过滤 |
-| `repository.py:1300` `latest_aggregate_id` | 详情判断"是不是当前结论" | 旧链接要能看出自己不是当前成绩（`current=false` + `superseded_by`） |
-| `repository.py:1491` `load_evaluation` | 按 `aggregate_id` 读回那一次结论 | 复核针对"某一次结论"，不能拿该答卷最新一次顶替 |
+| `repository.py:1439` `list_results` | 待复核队列 | 只列每份答卷**最新**的聚合结果；`pending=false` 时反过来列全部定稿历史，不套"最新"过滤 |
+| `repository.py:1528` `latest_aggregate_id` | 详情判断"是不是当前结论" | 旧链接要能看出自己不是当前成绩（`current=false` + `superseded_by`） |
+| `repository.py:1719` `load_evaluation` | 按 `aggregate_id` 读回那一次结论 | 复核针对"某一次结论"，不能拿该答卷最新一次顶替 |
 | `api/results.py:39` `_sample_rows` | 每个采样各自的等级 / 证据 / 偏移 | 采分点与扣分项共用这一段，别各写一份 |
 | `api/results.py:56` `_item_rows` | 采分点定义 + 逐采样判定 + 中位数等级拼成一行 | 证据优先取"等级=中位数且已接地"的那次采样；等级缺失直接 KeyError，**不补 0** |
 | `api/results.py:117` `_deduction_rows` | 扣分项：命中几次、是否计入 | `applied` 来自聚合结果，不是"任意一次命中" |
-| `repository.py:1313` `record_review` | 定稿：采纳或改分，写 `reviews` | 原分不改写；改分必须写理由；一份结果只能定稿一次 |
-| `repository.py:1376` `accept_high_confidence` | 批量通过 | **只收 `route='auto'`**；整批一个事务，混进一份不合格就整批不落库 |
-| `repository.py:1456` `_finalized_answer_ids` | 已定稿的答卷不能再评 | `create_task` 与 `save_evaluation_for_answer` 都查；否则一份答卷会出现两条"最终"记录 |
-| `repository.py:1472` `_require_current` | 拒绝给已被重评取代的旧结论定稿 | 队列藏起来只是第一道；接口再挡一次，防止旧链接 |
-| `repository.py:244` `_reviewed_score` | 最终分的两种来源 | accept 不接受"顺手改分"；override 校验有限性与 `[0, max]` |
-| `tables.py:274` `reviews` | 复核记录表 | `uq_reviews_aggregate` 是唯一索引：并发重复提交由数据库兜底 |
+| `repository.py:1541` `record_review` | 定稿：采纳或改分，写 `reviews` | 原分不改写；改分必须写理由；一份结果只能定稿一次 |
+| `repository.py:1604` `accept_high_confidence` | 批量通过 | **只收 `route='auto'`**；整批一个事务，混进一份不合格就整批不落库 |
+| `repository.py:1684` `_finalized_answer_ids` | 已定稿的答卷不能再评 | `create_task` 与 `save_evaluation_for_answer` 都查；否则一份答卷会出现两条"最终"记录 |
+| `repository.py:1700` `_require_current` | 拒绝给已被重评取代的旧结论定稿 | 队列藏起来只是第一道；接口再挡一次，防止旧链接 |
+| `repository.py:262` `_reviewed_score` | 最终分的两种来源 | accept 不接受"顺手改分"；override 校验有限性与 `[0, max]` |
+| `tables.py:299` `reviews` | 复核记录表 | `uq_reviews_aggregate` 是唯一索引：并发重复提交由数据库兜底 |
 
 **一处要看懂的区别**：`raw_score` 与 `final_score` 是两份证据。
 
@@ -815,6 +824,40 @@ python3 -m unittest tests.test_api_reviews -v   # 25 个用例：HTTP 层
 （那正是系统认为需要人看一眼的那批；允许批量放行等于让路由失效。）
 定稿之后还能重新评分吗？（不能：`create_task` 会拒绝已定稿的答卷。没有这个约束，
 一份答卷会出现两条互不隶属的"最终"记录。）
+
+---
+
+### ⑭ 标准的保存与迭代：`app/api/rubrics.py` + `store` 的 `save_rubric`（约 20 分钟）
+
+**职责**：把确认过的标准存成**新版本**，并把"改一句"（迭代生成）与"改一行"（行内编辑）两条路走通。
+
+| 位置 | 在干什么 | 读的时候注意 |
+| --- | --- | --- |
+| `api/rubrics.py:38` `_save` | 保存的唯一入口：校验 → 追加版本 | 阻断项一次全给，`issues` 的消息里带具体条目（P1 / D1） |
+| `api/rubrics.py:28` `_document` | 打开某一版时附上校验清单 | 已保存的标准没有阻断项，但仅提示项仍然值得看 |
+| `api/rubrics.py:98` `generate` | 生成草稿（不落库） | 模型失败 → 502；两次都不合法 → 422 + `issues` |
+| `api/rubrics.py:121` `iterate` | 上一版 + 一条意见 | 上一版从库里读，不信任客户端回传；`based_on` 标明基线，`changes` 是服务端算的 diff |
+| `api/rubrics.py:162` `update_rubric` | 行内编辑后保存 | 题号不许改；原话没重发就沿用上一版 |
+| `repository.py:636` `save_rubric` | 保存：upsert 题目 + 追加版本 | 内容与最新版相同就复用，不制造空版本 |
+| `repository.py:578` `_append_rubric` | 版本号 +1 与 checksum | 版本只增不改；任务快照指过去以后旧版永远在 |
+| `repository.py:551` `_upsert_question` | 同步题干 / 满分 | 标准与题目表不能各说一套 |
+| `repository.py:721` `list_rubrics` | 列表只给每道题的最新版 | 历史版本按 id 打开 |
+| `repository.py:757` `get_rubric` | 某一版 + `source_text` / `feedback` | 溯源跟着版本走 |
+
+**一处要看清的语义**：`POST /api/rubrics` 与 `PUT /api/rubrics/{id}` 都落到 `save_rubric`。
+前者用于首次保存或整份提交；后者多两道约束——基线必须存在、题号不许改。
+两条路都**只追加版本**，不会原地改一行。
+
+**动手验证**：
+
+```bash
+cd backend
+python3 -m unittest tests.test_rubric_store -v   # 10 个用例：版本、列表、溯源、任务快照
+python3 -m unittest tests.test_api_rubrics -v    # 20 个用例：生成 → 保存 → 编辑 → 迭代
+```
+
+**读完要能回答**：为什么行内编辑要"追加一版"而不是"改那一行"？
+（任务快照用外键指向某一版；原地改会让历史记录的标准跟着变，等于篡改过去的评分依据。）
 
 ---
 
@@ -851,13 +894,13 @@ pipeline.py:124 evaluate
 ### 主线 C：为什么改了评分标准，旧记录还是对的
 
 ```text
-store/repository.py:527 _ensure_rubric
+store/repository.py:631 _ensure_rubric
     算 schema_json 的 sha256 → 与最新版本比对
     相同 → 复用这一行；不同 → version + 1，插入新行
         ↓
 grading_runs.rubric_id 外键指向那一行（永不修改）
         ↓
-store/repository.py:1491 load_evaluation
+store/repository.py:1719 load_evaluation
     从 aggregate 的 rubric_id 反查 rubrics.schema_json → from_dict → 当时那份标准
         ↓
 reviews.aggregated_result_id 指向**那一次**聚合结果
@@ -880,7 +923,9 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 | `test_pipeline.py` | 10 | 模型给的分数一律不采信；缺采分点/非法等级要显式失败 |
 | `test_aggregate.py` | 10 | 偶数采样取下中位；扣分项分歧计入离散度；置信度含接地率因子 |
 | `test_deepseek_provider.py` | 12 | 请求形状、状态码映射、空响应重试、配置读取（含生成/评分模型分开配）（**不联网**） |
-| `test_rubric_gen.py` | 20 | 生成提示词含纪律；重试带上错误且禁止补点；模型改不了 `rules`/`must_hit`；三视图各就各位 |
+| `test_rubric_gen.py` | 30 | 生成提示词含纪律；迭代只改指出的部分；重试带上错误且禁止补点；模型改不了 `rules`/`must_hit`；三视图各就各位 |
+| `test_rubric_store.py` | 10 | 版本只增不改；列表只给最新版；题干与满分同步；任务快照不被后续编辑移动 |
+| `test_api_rubrics.py` | 20 | 生成 → 保存 → 列表/打开 → 行内编辑 → 迭代；结构错误逐条拒绝；题号不可改；编辑后任务仍指旧版 |
 | `test_gen_rubric_script.py` | 6 | 生成脚本的退出码（含模型调用失败）与三视图输出；保存的标准能直接喂给评分 |
 | `test_cli.py` | 5 | 报告字段齐全；错误码；`--save` 能读回 |
 | `test_store.py` | 17 | 字段无损往返；标准快照不可变；重评后按旧运行号不会串到新结论；导入与查重 |
@@ -948,6 +993,18 @@ curl -s -b /tmp/c.txt -X POST localhost:8000/api/results/1/review \
 curl -s -b /tmp/c.txt -X POST localhost:8000/api/results/batch-accept \
   -H 'content-type: application/json' -d '{"aggregate_ids":[2,3]}'
 
+# 标准的生成 / 保存 / 列表 / 行内编辑 / 迭代
+curl -s -b /tmp/c.txt -X POST localhost:8000/api/rubrics/generate \
+  -H 'content-type: application/json' \
+  -d '{"stem":"简述 TCP 三次握手","total_score":10,"standard_text":"三个要点……"}'
+curl -s -b /tmp/c.txt -X POST localhost:8000/api/rubrics \
+  -H 'content-type: application/json' \
+  --data-binary @<(python3 -c 'import json;print(json.dumps({"rubric":json.load(open("../data/samples/tcp-handshake/rubric.json")),"source_text":"三个要点……"}))')
+curl -s -b /tmp/c.txt localhost:8000/api/rubrics
+curl -s -b /tmp/c.txt localhost:8000/api/rubrics/1
+curl -s -b /tmp/c.txt -X POST localhost:8000/api/rubrics/1/iterate \
+  -H 'content-type: application/json' -d '{"feedback":"P3 拆得太粗，拆成两个采分点"}'
+
 # 从教师原话生成结构化标准（离线；加 --live 则真调模型）
 cd backend
 python3 scripts/gen_rubric.py --stem "题干" --total 10 --standard "教师原话" \
@@ -996,6 +1053,7 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 | 改导入格式（如 Excel） | `app/importing.py` 加一个 `source` 分支 | `store/`、`api/` |
 | 换会话存储（Redis / 数据库） | 只换 `AdminAuth` 的登记表实现 | `api/`、`main.py` |
 | 加一种复核结论（如"退回重评"） | `store/repository.py` 的 `record_review` + `api/results.py` + `reviews.decision` 的取值 | `core/`、`pipeline.py` |
+| 加一种标准修改方式（如批量改权重） | `api/rubrics.py` 的 `_save` + `store.save_rubric` | `core/rubric.py` 的校验规则（除非真的要加新规则） |
 
 `Store` 的公开成员：`from_url` / `engine` / `dispose` / `save_evaluation` /
 `save_evaluation_for_answer` / `load_evaluation`（按答卷号、运行号或聚合结果号）/ `get_question` /
@@ -1003,7 +1061,7 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 `load_rubric` / `create_task` / `get_task` / `list_task_items` / `claim_next_item` /
 `finish_task_item` / `task_item_views` / `set_task_status` / `reset_failed_items` /
 `mark_interrupted_tasks` / `list_results` / `load_review` / `record_review` /
-`accept_high_confidence`。
+`accept_high_confidence` / `save_rubric` / `list_rubrics` / `get_rubric`。
 `create_schema` 已经被拿掉了——建表只能走迁移，`tests/support.py` 里那份是测试专用。
 
 ---
@@ -1016,7 +1074,6 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 | --- | --- | --- |
 | 复核界面 | #15 | 接口与存储都已落地，`frontend/` 还没有 |
 | 导入批次撤销 | 未定 | 只能按 answer_id 删；验收只要求"取消导入不产生数据"，已满足 |
-| 自然语言 → 标准（HTTP 接口） | #11 | 生成逻辑已在 `app/rubric_gen.py`，但只有脚本入口，没有 REST |
 | 分数校准 | 校准层 | `core/calibrate.py` **不存在**；`calibrated_score` 恒为 `NULL` |
 | 模型能力注册表 | 后续 | `providers/registry.py` **不存在** |
 | 前端 | #12–#15 | `frontend/` 目录不存在 |

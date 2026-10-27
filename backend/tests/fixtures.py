@@ -90,6 +90,31 @@ def payload_text(**overrides) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
+def rubric_variant(**changes) -> dict:
+    """在夹具标准上做局部修改，返回**未解析**的 dict。
+
+    采分点按 id 指定（`_items={"P1": {"desc": ...}}`），其余键（`question_id`、`stem`、
+    `total_score`……）直接覆盖顶层。深拷贝，避免测试之间互相改到同一份常量。
+    """
+    data = json.loads(json.dumps(RUBRIC_DATA))
+    items = changes.pop("_items", {})
+    data.update(changes)
+    for item_id, patch in items.items():
+        data["items"][int(item_id[1:]) - 1].update(patch)
+    return data
+
+
+def generation_payload(**overrides) -> str:
+    """模型对"生成标准"的典型回答：摘要 + 采分点 + 扣分项。"""
+    data = {
+        "summary": "本题按三次握手的三个步骤拆成三个采分点，另设一个混淆扣分项。",
+        "items": json.loads(json.dumps(RUBRIC_DATA["items"])),
+        "deductions": json.loads(json.dumps(RUBRIC_DATA["deductions"])),
+    }
+    data.update(overrides)
+    return json.dumps(data, ensure_ascii=False)
+
+
 def payload_with_levels(*levels) -> str:
     """固定三个采分点的等级，生成一次采样的模型输出。"""
     data = json.loads(payload_text())

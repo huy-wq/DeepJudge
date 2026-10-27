@@ -95,6 +95,10 @@ class ResultNotFound(LookupError):
     """要复核的评分结果不存在。"""
 
 
+class RubricNotFound(LookupError):
+    """要打开或迭代的评分标准版本不存在。"""
+
+
 class ResultFinalized(Exception):
     """这份结果已经有复核记录，即已定稿。
 
@@ -163,6 +167,20 @@ class ReviewRecord:
     decision: str
     comment: str
     created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class SavedRubric:
+    """一份被保存（或命中最新的同内容版本）的评分标准。"""
+
+    rubric_id: int
+    question_pk: int
+    question_code: str
+    version: int
+    checksum: str
+    parent_rubric_id: int | None
+    created_at: datetime | None
+    reused: bool
 
 
 @dataclass(frozen=True)
@@ -509,12 +527,18 @@ class Store:
         ).inserted_primary_key[0]
         return run_ids, aggregate_id
 
+    def _question_id_of(self, conn, code: str, *, lock: bool = False) -> int | None:
+        query = select(questions.c.id).where(questions.c.code == code)
+        if lock:
+            query = query.with_for_update()
+        row = conn.execute(query).first()
+        return None if row is None else row[0]
+
     def _ensure_question(self, conn, rubric: Rubric) -> int:
-        row = conn.execute(
-            select(questions.c.id).where(questions.c.code == rubric.question_id)
-        ).first()
-        if row is not None:
-            return row[0]
+        """评分写入路径专用：题目只在第一次出现时创建，不改题干与满分。"""
+        question_id = self._question_id_of(conn, rubric.question_id)
+        if question_id is not None:
+            return question_id
         return conn.execute(
             questions.insert().values(
                 code=rubric.question_id,
@@ -524,8 +548,47 @@ class Store:
             )
         ).inserted_primary_key[0]
 
-    def _ensure_rubric(self, conn, question_id: int, rubric: Rubric) -> int:
-        """内容没变就复用最新版本，变了就追加一版；已有版本永不修改。"""
+    def _upsert_question(self, conn, rubric: Rubric) -> int:
+        """保存标准路径专用：题干与满分跟着这一版走。
+
+        标准里存着 stem / total_score，`questions` 表里也存一份（列表页要读）。
+        只创建不更新，就会留下"标准说 12 分、题目说 10 分"这种两套真相。
+
+        先锁题目行：两个并发的"保存"会各算一次 version+1，第二个撞
+        `uq_rubrics_question_version`。加锁后它们串行化（MySQL）；题目还不存在时，
+        InnoDB 的间隙锁同样挡住"同时插同一题号"。
+        """
+        question_id = self._question_id_of(conn, rubric.question_id, lock=True)
+        if question_id is None:
+            return conn.execute(
+                questions.insert().values(
+                    code=rubric.question_id,
+                    stem=rubric.stem,
+                    total_score=rubric.total_score,
+                    status="active",
+                )
+            ).inserted_primary_key[0]
+        conn.execute(
+            questions.update()
+            .where(questions.c.id == question_id)
+            .values(stem=rubric.stem, total_score=rubric.total_score)
+        )
+        return question_id
+
+    def _append_rubric(
+        self,
+        conn,
+        question_id: int,
+        rubric: Rubric,
+        *,
+        source_text: str = "",
+        feedback: str = "",
+        parent_rubric_id: int | None = None,
+    ) -> tuple[int, int, str, bool]:
+        """内容没变就复用最新版本，变了就追加一版；已有版本永不修改。
+
+        返回 (rubric_id, version, checksum, reused)。
+        """
         payload = to_dict(rubric)
         digest = _checksum(payload)
 
@@ -536,17 +599,182 @@ class Store:
             .limit(1)
         ).first()
         if latest is not None and latest[2] == digest:
-            return latest[0]
+            return latest[0], latest[1], latest[2], True
 
         next_version = 1 if latest is None else latest[1] + 1
-        return conn.execute(
-            rubrics.insert().values(
-                question_id=question_id,
-                version=next_version,
-                schema_json=payload,
-                checksum=digest,
+        try:
+            rubric_id = conn.execute(
+                rubrics.insert().values(
+                    question_id=question_id,
+                    version=next_version,
+                    schema_json=payload,
+                    checksum=digest,
+                    source_text=source_text,
+                    feedback=feedback,
+                    parent_rubric_id=parent_rubric_id,
+                )
+            ).inserted_primary_key[0]
+        except IntegrityError:
+            # 两个并发保存各算了一次 version+1：后到的撞唯一约束。
+            # 如果对方写的正是同一份内容，就复用它（这才是常见情况：同一份标准被存两次）。
+            latest = conn.execute(
+                select(rubrics.c.id, rubrics.c.version, rubrics.c.checksum)
+                .where(rubrics.c.question_id == question_id)
+                .order_by(rubrics.c.version.desc())
+                .limit(1)
+            ).first()
+            if latest is not None and latest[2] == digest:
+                return latest[0], latest[1], latest[2], True
+            raise
+        return rubric_id, next_version, digest, False
+
+    def _ensure_rubric(self, conn, question_id: int, rubric: Rubric) -> int:
+        return self._append_rubric(conn, question_id, rubric)[0]
+
+    # ------------------------------------------------------------------ 标准的保存与迭代
+
+    def save_rubric(
+        self,
+        rubric: Rubric,
+        *,
+        source_text: str = "",
+        feedback: str = "",
+        based_on_rubric_id: int | None = None,
+    ) -> SavedRubric:
+        """保存一份标准（新建或改完再存）。
+
+        **版本只增不改**：内容与最新版相同就复用那一行，不同就追加一版。
+        这样"教师确认过的某一版"永远能被任务快照指回去（架构 §5.5）。
+
+        `based_on_rubric_id` 记录"这一版是从哪一版改出来的"——版本号只说明先后，
+        不说明来源；改了旧版本再存时，两者会不一致。
+        """
+        with self._engine.begin() as conn:
+            base_question = None
+            if based_on_rubric_id is not None:
+                base = conn.execute(
+                    select(rubrics.c.id, rubrics.c.question_id).where(
+                        rubrics.c.id == based_on_rubric_id
+                    )
+                ).first()
+                if base is None:
+                    raise RubricNotFound(f"评分标准版本不存在：{based_on_rubric_id}")
+                base_question = base[1]
+            question_id = self._upsert_question(conn, rubric)
+            if base_question is not None and base_question != question_id:
+                raise ValueError("基线标准不属于同一道题，不能在这上面继续改")
+            rubric_id, version, digest, reused = self._append_rubric(
+                conn,
+                question_id,
+                rubric,
+                source_text=source_text,
+                feedback=feedback,
+                parent_rubric_id=based_on_rubric_id,
             )
-        ).inserted_primary_key[0]
+            if reused:
+                # 评分写入路径可能先建过同一内容、但没带原话；这次保存把空着的溯源补上。
+                # 只补空值，不覆盖已有的原话/意见。
+                self._fill_provenance(conn, rubric_id, source_text, feedback)
+            row = conn.execute(
+                select(rubrics.c.created_at, rubrics.c.parent_rubric_id).where(
+                    rubrics.c.id == rubric_id
+                )
+            ).first()
+        return SavedRubric(
+            rubric_id=rubric_id,
+            question_pk=question_id,
+            question_code=rubric.question_id,
+            version=version,
+            checksum=digest,
+            parent_rubric_id=row[1],
+            created_at=row[0],
+            reused=reused,
+        )
+
+    def _fill_provenance(
+        self, conn, rubric_id: int, source_text: str, feedback: str
+    ) -> None:
+        values: dict[str, Any] = {}
+        if source_text.strip():
+            values["source_text"] = source_text
+        if feedback.strip():
+            values["feedback"] = feedback
+        if not values:
+            return
+        row = conn.execute(
+            select(rubrics.c.source_text, rubrics.c.feedback).where(
+                rubrics.c.id == rubric_id
+            )
+        ).first()
+        if row is None:
+            return
+        updates = {
+            key: value
+            for key, value in values.items()
+            if not (row[0] if key == "source_text" else row[1]).strip()
+        }
+        if updates:
+            conn.execute(
+                rubrics.update().where(rubrics.c.id == rubric_id).values(**updates)
+            )
+
+    def list_rubrics(self) -> list[dict[str, Any]]:
+        """列出每道题**最新一版**标准（列表页只需要最新版；历史版本按 id 打开）。"""
+        latest_version = (
+            select(func.max(rubrics.c.version))
+            .where(rubrics.c.question_id == questions.c.id)
+            # 只把 questions 关联进来；不写死的话 SQLAlchemy 会把 rubrics 也自动关联掉，
+            # 子查询就变成"没有 FROM 的 max(version)"
+            .correlate(questions)
+            .scalar_subquery()
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(
+                    rubrics.c.id.label("rubric_id"),
+                    rubrics.c.version,
+                    rubrics.c.schema_json,
+                    rubrics.c.created_at,
+                    questions.c.code.label("question_code"),
+                )
+                .select_from(rubrics.join(questions, rubrics.c.question_id == questions.c.id))
+                .where(rubrics.c.version == latest_version)
+                .order_by(questions.c.code)
+            ).mappings().all()
+        return [
+            {
+                "rubric_id": row["rubric_id"],
+                "version": row["version"],
+                "question_code": row["question_code"],
+                "stem": row["schema_json"].get("stem", ""),
+                "total_score": row["schema_json"].get("total_score", 0),
+                "item_count": len(row["schema_json"].get("items") or []),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def get_rubric(self, rubric_id: int) -> dict[str, Any] | None:
+        """按编号打开**某一版**标准，含当时的教师原话与修改意见。"""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(
+                    rubrics.c.id.label("rubric_id"),
+                    rubrics.c.version,
+                    rubrics.c.schema_json.label("rubric"),
+                    rubrics.c.checksum,
+                    rubrics.c.source_text,
+                    rubrics.c.feedback,
+                    rubrics.c.created_at,
+                    rubrics.c.parent_rubric_id,
+                    questions.c.code.label("question_code"),
+                )
+                .select_from(rubrics.join(questions, rubrics.c.question_id == questions.c.id))
+                .where(rubrics.c.id == rubric_id)
+            ).mappings().first()
+        if row is None:
+            return None
+        return dict(row)
 
     def _insert_judgements(self, conn, run_id: int, sample) -> None:
         rows = [
