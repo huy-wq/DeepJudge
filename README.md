@@ -102,7 +102,7 @@ ADMIN_PASSWORD=换个只有你知道的口令 python3 -m uvicorn app.main:create
 ```
 
 没有 `ADMIN_PASSWORD` 会直接启动失败——不会静默跑起来一个谁都能进的管理端。
-目前接口只有登录、退出、会话查询与健康检查（业务接口在后续工单里）：
+所有管理接口都在口令 + 会话之后；先换一个 cookie：
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/auth/session        # 401
@@ -150,6 +150,27 @@ curl -s -b /tmp/c.txt -X POST http://127.0.0.1:8000/api/tasks/1/retry \
 单份失败不会中断整批：它会被标成 `failed` 并附上原因，其余照常评完。
 任务跑在进程内线程池里（`GRADING_CONCURRENCY`，默认 2），进程重启后残留的 running 任务会被标为
 `interrupted` 并可重试。
+
+**复核与定稿（改分要写理由，定稿只发生一次）**
+
+```bash
+# 待复核队列：只有 route=human 的当前结论，risk 从高到低
+curl -s -b /tmp/c.txt "http://127.0.0.1:8000/api/results?route=human"
+
+# 详情：逐条判定、证据在原文中的起止位置、每次采样各自的等级
+curl -s -b /tmp/c.txt http://127.0.0.1:8000/api/results/1
+
+# 改分并定稿：原分不会被改写，复核记录里同时留下修改人与意见
+curl -s -b /tmp/c.txt -X POST http://127.0.0.1:8000/api/results/1/review   -H 'content-type: application/json'   -d '{"decision":"override","final_score":6.5,"comment":"P2 的证据只覆盖半个要点"}'
+
+# 批量通过自动路由的结果（含 route=human 的必须逐份看，混进来会整批拒绝）
+curl -s -b /tmp/c.txt "http://127.0.0.1:8000/api/results?route=auto"
+curl -s -b /tmp/c.txt -X POST http://127.0.0.1:8000/api/results/batch-accept   -H 'content-type: application/json' -d '{"aggregate_ids":[2,3]}'
+```
+
+一份结果只能定稿一次（重复提交 409）。定稿之后即使评分标准再改，这份结果与它的采分点描述也不会变；
+已定稿的答卷也不能再进入新的评分任务或重新评分——更正需要撤销定稿，当前版本没有该入口。
+任务列表里这份答卷的状态会变成 `finalized`，并同时给出 `final_score`（模型原分仍在 `score`）。
 
 **先把教师的一段口述变成结构化标准**
 

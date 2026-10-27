@@ -5,7 +5,6 @@
 """
 
 import copy
-import json
 import unittest
 
 try:
@@ -20,15 +19,8 @@ from app.core.rubric import from_dict
 from app.pipeline import evaluate
 from app.providers.fake import CannedProvider
 from app.store import QuestionNotFound, RunMeta, Store
-from tests.fixtures import ANSWER, RUBRIC_DATA, payload_text
+from tests.fixtures import ANSWER, RUBRIC_DATA, payload_text, payload_with_levels
 from tests.support import create_schema
-
-
-def payload_with_levels(*levels) -> str:
-    data = json.loads(payload_text())
-    for item, level in zip(data["items"], levels):
-        item["level"] = level
-    return json.dumps(data, ensure_ascii=False)
 
 
 class StoreTestCase(unittest.TestCase):

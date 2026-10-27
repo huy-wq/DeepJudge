@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from .api import errors
 from .api import register as register_auth
 from .api.answers import register as register_answers
+from .api.results import register as register_results
 from .api.tasks import register as register_tasks
 from .auth import SESSION_TTL_SECONDS, AdminAuth
 from .providers.base import GradingProvider, ProviderError
@@ -94,6 +95,7 @@ def create_app(
     register_auth(app, auth, secure_cookie=_env_flag("COOKIE_SECURE"))
     register_answers(app)
     register_tasks(app)
+    register_results(app)
     return app
 
 

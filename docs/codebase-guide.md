@@ -6,9 +6,9 @@
 >
 > 若两者冲突，以 `docs/architecture.md` 为准；发现冲突请改本文件。
 
-**当前状态**：218 个测试通过（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
-裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归），约 11000 行（含文档与测试）。
-已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#10 标准生成。
+**当前状态**：269 个测试通过（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
+裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归），约 12000 行（含文档与测试）。
+已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成。
 **没有**的部分见 §8，别在代码里找不存在的东西。
 
 ---
@@ -46,7 +46,7 @@ backend/
 │   ├── cli.py           ← 命令行入口与报告组装
 │   └── config.py        ← .env 读取
 ├── migrations/          ← Alembic 迁移（表结构的部署真源）
-├── tests/               ← 218 个用例
+├── tests/               ← 269 个用例
 └── scripts/             ← 实验脚本（backend/scripts，如方差实测）
 
 仓库根目录还有：docker-compose.yml（本地 MySQL 8）、scripts/dev-db.sh（一键起库 + 迁移）。
@@ -62,11 +62,12 @@ backend/
 | `pipeline.py` | 154 | core + providers | ⑥ |
 | `rubric_gen.py` | 257 | core + providers | ⑥′（与评分并列的另一条主线） |
 | `core/aggregate.py` + `core/routing.py` | 194 | 仅标准库 | ⑦ |
-| `store/` | 719 | SQLAlchemy | ⑧ |
+| `store/` | 1665 | SQLAlchemy | ⑧ |
 | `cli.py` | 206 | 全部 | ⑨ |
-| `auth.py` + `api/` + `main.py` | 约 400 | FastAPI | ⑩（另一条主线：HTTP 入口） |
+| `auth.py` + `api/` + `main.py` | 约 1000 | FastAPI | ⑩（另一条主线：HTTP 入口） |
 | `importing.py` | 260 | 仅标准库 + core | ⑪（答卷怎么进来） |
 | `tasks.py` | 190 | core + providers + store | ⑫（怎么批量评） |
+| `api/results.py` | 264 | FastAPI + store | ⑬（复核队列与定稿） |
 
 **依赖方向是硬约束，不是风格建议。** 可以用一条命令自己验：
 
@@ -95,6 +96,8 @@ cd backend && grep -h "^import \|^from " app/core/*.py | grep -v "^from \." | so
 
 > 八步之外还有一条更上游的线：**先有标准，才谈得上评分**。
 > 教师的一段口述怎么变成这份 rubric，看 `app/rubric_gen.py`（见 §2 ⑥′）。
+> 第 8 步之后还有一条人工线：**转人工的结果怎么定稿**，看 `app/api/results.py` 与
+> `store/repository.py` 的复核段（见 §2 ⑬）。
 
 **读这张表要抓住的一件事**：八步里只有第 4 步不可控，而它被 `GradingProvider` 一个方法包住。
 其余七步全是纯函数或纯数据库操作。这就是为什么测试能覆盖 95% 而不联网：
@@ -734,9 +737,9 @@ curl -s -b /tmp/c.txt -X POST localhost:8000/api/answers/preview \
 | `:116` `_grade_one` | 评一份：取答卷 → 取标准快照 → `evaluate` → 落库 | 所有异常都在这层被吃成 `failed`，绝不冒泡 |
 | `:83` `_run` | 任务级收尾 | **必须有 except**：执行器自己崩了也要把任务标成 `interrupted` 并记原因，否则它永远停在 running |
 | `app/store/repository.py:819` `claim_next_item` | **CAS** 领取：带 `status='pending'` 条件更新 | 先读后写会有一份答卷被评两次（本票踩过） |
-| `repository.py:692` `create_task` | 建任务 + 固定 `rubric_id` | 任务级快照：之后改标准不影响这批 |
-| `repository.py:895` `task_item_views` | 进度查询（含分数与 `route`） | "待复核"由 `route` 派生，不另存 |
-| `repository.py:977` `mark_interrupted_tasks` | 启动时清理上次的 running | 没有它，崩溃后任务永远显示"进行中" |
+| `repository.py:816` `create_task` | 建任务 + 固定 `rubric_id` | 任务级快照：之后改标准不影响这批 |
+| `repository.py:1037` `task_item_views` | 进度查询（含 `score`、`route`、`final_score`、`current`） | "待复核"/"已定稿"/"已过期"由 `route`、复核记录、`current` 派生，不另存 |
+| `repository.py:1144` `mark_interrupted_tasks` | 启动时清理上次的 running | 没有它，崩溃后任务永远显示"进行中" |
 | `app/api/tasks.py:54` `POST /api/tasks` | 建任务并 `runner.start` | 参数校验：答卷必须属于该题 |
 | `:75` `POST /api/tasks/{id}/retry` | 只把失败项放回 pending | 可传 `answer_ids` 只重试指定几份 |
 
@@ -767,6 +770,51 @@ python3 -m unittest tests.test_api_tasks -v      # 9 个用例，HTTP 层
 
 **读完要能回答**：任务"跑完了但有失败项"，状态应该是 `done` 还是 `failed`？
 （`done`。状态在每一项上；把任务标成 failed 会掩盖"大部分已经评完"这个事实。）
+
+---
+
+### ⑬ 复核与定稿：`store/repository.py` 的复核段 + `app/api/results.py`（约 25 分钟）
+
+**职责**：把 `route == 'human'` 的结果送进队列，让教师看清"这一分怎么来的"，然后一次性定稿。
+
+| 位置 | 在干什么 | 读的时候注意 |
+| --- | --- | --- |
+| `repository.py:1211` `list_results` | 待复核队列 | 只列每份答卷**最新**的聚合结果；`pending=false` 时反过来列全部定稿历史，不套"最新"过滤 |
+| `repository.py:1300` `latest_aggregate_id` | 详情判断"是不是当前结论" | 旧链接要能看出自己不是当前成绩（`current=false` + `superseded_by`） |
+| `repository.py:1491` `load_evaluation` | 按 `aggregate_id` 读回那一次结论 | 复核针对"某一次结论"，不能拿该答卷最新一次顶替 |
+| `api/results.py:39` `_sample_rows` | 每个采样各自的等级 / 证据 / 偏移 | 采分点与扣分项共用这一段，别各写一份 |
+| `api/results.py:56` `_item_rows` | 采分点定义 + 逐采样判定 + 中位数等级拼成一行 | 证据优先取"等级=中位数且已接地"的那次采样；等级缺失直接 KeyError，**不补 0** |
+| `api/results.py:117` `_deduction_rows` | 扣分项：命中几次、是否计入 | `applied` 来自聚合结果，不是"任意一次命中" |
+| `repository.py:1313` `record_review` | 定稿：采纳或改分，写 `reviews` | 原分不改写；改分必须写理由；一份结果只能定稿一次 |
+| `repository.py:1376` `accept_high_confidence` | 批量通过 | **只收 `route='auto'`**；整批一个事务，混进一份不合格就整批不落库 |
+| `repository.py:1456` `_finalized_answer_ids` | 已定稿的答卷不能再评 | `create_task` 与 `save_evaluation_for_answer` 都查；否则一份答卷会出现两条"最终"记录 |
+| `repository.py:1472` `_require_current` | 拒绝给已被重评取代的旧结论定稿 | 队列藏起来只是第一道；接口再挡一次，防止旧链接 |
+| `repository.py:244` `_reviewed_score` | 最终分的两种来源 | accept 不接受"顺手改分"；override 校验有限性与 `[0, max]` |
+| `tables.py:274` `reviews` | 复核记录表 | `uq_reviews_aggregate` 是唯一索引：并发重复提交由数据库兜底 |
+
+**一处要看懂的区别**：`raw_score` 与 `final_score` 是两份证据。
+
+```text
+aggregated_results.raw_score   模型按等级算出来的分（服务端算，但不含人工判断）
+reviews.final_score            人工定稿的分
+```
+
+覆盖 `raw_score` 就永远说不清"老师改了几分、为什么改"；所以复核只追加，不修改。
+定稿之后，任务列表里那份答卷的 `state` 变成 `finalized` 并带上 `final_score`，
+`score` 仍是模型原分——两个字段并排，才看得出人改了多少。
+
+**动手验证**：
+
+```bash
+cd backend
+python3 -m unittest tests.test_reviews -v       # 24 个用例：队列 / 定稿 / 批量 / 快照
+python3 -m unittest tests.test_api_reviews -v   # 25 个用例：HTTP 层
+```
+
+**读完要能回答**：为什么"批量通过"不能接受 `route='human'` 的结果？
+（那正是系统认为需要人看一眼的那批；允许批量放行等于让路由失效。）
+定稿之后还能重新评分吗？（不能：`create_task` 会拒绝已定稿的答卷。没有这个约束，
+一份答卷会出现两条互不隶属的"最终"记录。）
 
 ---
 
@@ -803,14 +851,17 @@ pipeline.py:124 evaluate
 ### 主线 C：为什么改了评分标准，旧记录还是对的
 
 ```text
-store/repository.py:274 _ensure_rubric
+store/repository.py:527 _ensure_rubric
     算 schema_json 的 sha256 → 与最新版本比对
     相同 → 复用这一行；不同 → version + 1，插入新行
         ↓
 grading_runs.rubric_id 外键指向那一行（永不修改）
         ↓
-store/repository.py:331 load_evaluation
+store/repository.py:1491 load_evaluation
     从 aggregate 的 rubric_id 反查 rubrics.schema_json → from_dict → 当时那份标准
+        ↓
+reviews.aggregated_result_id 指向**那一次**聚合结果
+    定稿只追加 reviews 一行；标准再改也改不动已经定稿的 final_score
 ```
 
 ---
@@ -834,7 +885,9 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 | `test_cli.py` | 5 | 报告字段齐全；错误码；`--save` 能读回 |
 | `test_store.py` | 17 | 字段无损往返；标准快照不可变；重评后按旧运行号不会串到新结论；导入与查重 |
 | `test_tasks.py` | 14 | 并发领取不重复、单份失败隔离、快照固定、失败项可单独重试、重启标中断、**执行器崩溃后任务可重试** |
-| `test_api_tasks.py` | 11 | 建任务/查进度/重试；派生状态 `state`；重复 id 去重；跨题 id 400；未登录 401 |
+| `test_api_tasks.py` | 12 | 建任务/查进度/重试；派生状态 `state`；重复 id 去重；跨题 id 400；未登录 401 |
+| `test_reviews.py` | 24 | 队列只列待人工且按 risk 排序；重评后旧结论出队且拒绝定稿；定稿只一次；批量通过只收 `auto`；定稿后改标准不影响 |
+| `test_api_reviews.py` | 25 | 登录保护；详情含证据偏移、逐采样等级与分歧；改分缺意见 400、重复 409、过期 409；批量通过 |
 | `test_migrations.py` | 2 | 迁移建出的表 == `tables.py`（逐列、逐索引、逐外键） |
 | `test_store_mysql.py` | 3 | 真库 `utf8mb4`；中文与 emoji 在 TEXT 与 **JSON 列**都能存活（默认跳过） |
 | `test_importing.py` | 25 | 两种来源、表头（含空列不错位）、列数、坏行、BOM/CRLF、引号内换行、**坏行不回显学号** |
@@ -886,6 +939,15 @@ curl -s -b /tmp/c.txt -X POST localhost:8000/api/tasks -H 'content-type: applica
 curl -s -b /tmp/c.txt localhost:8000/api/tasks/1
 curl -s -b /tmp/c.txt -X POST localhost:8000/api/tasks/1/retry -H 'content-type: application/json' -d '{"answer_ids":[]}'
 
+# 复核：队列 → 详情 → 改分 / 批量通过
+curl -s -b /tmp/c.txt "localhost:8000/api/results?route=human"
+curl -s -b /tmp/c.txt localhost:8000/api/results/1
+curl -s -b /tmp/c.txt -X POST localhost:8000/api/results/1/review \
+  -H 'content-type: application/json' \
+  -d '{"decision":"override","final_score":6.5,"comment":"P2 证据只覆盖半个要点"}'
+curl -s -b /tmp/c.txt -X POST localhost:8000/api/results/batch-accept \
+  -H 'content-type: application/json' -d '{"aggregate_ids":[2,3]}'
+
 # 从教师原话生成结构化标准（离线；加 --live 则真调模型）
 cd backend
 python3 scripts/gen_rubric.py --stem "题干" --total 10 --standard "教师原话" \
@@ -933,9 +995,15 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 | 加 HTTP 接口 | `app/api/*.py` 里加 `register(app)`，受保护接口挂 `Depends(require_admin)`，要库的挂 `Depends(require_store)` | `core/`、`auth.py` |
 | 改导入格式（如 Excel） | `app/importing.py` 加一个 `source` 分支 | `store/`、`api/` |
 | 换会话存储（Redis / 数据库） | 只换 `AdminAuth` 的登记表实现 | `api/`、`main.py` |
+| 加一种复核结论（如"退回重评"） | `store/repository.py` 的 `record_review` + `api/results.py` + `reviews.decision` 的取值 | `core/`、`pipeline.py` |
 
-`Store` 的公开成员：`from_url` / `engine` / `dispose` / `save_evaluation` / `load_evaluation` /
-`get_question` / `find_duplicates` / `import_answers` / `list_answers` / `count_answers`。
+`Store` 的公开成员：`from_url` / `engine` / `dispose` / `save_evaluation` /
+`save_evaluation_for_answer` / `load_evaluation`（按答卷号、运行号或聚合结果号）/ `get_question` /
+`find_duplicates` / `import_answers` / `list_answers` / `count_answers` / `get_answer` /
+`load_rubric` / `create_task` / `get_task` / `list_task_items` / `claim_next_item` /
+`finish_task_item` / `task_item_views` / `set_task_status` / `reset_failed_items` /
+`mark_interrupted_tasks` / `list_results` / `load_review` / `record_review` /
+`accept_high_confidence`。
 `create_schema` 已经被拿掉了——建表只能走迁移，`tests/support.py` 里那份是测试专用。
 
 ---
@@ -946,13 +1014,12 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 
 | 缺什么 | 属于哪张工单 | 现状 |
 | --- | --- | --- |
-| 复核接口与页面 | #9 | `reviews` 表已建但无读写代码；`app/api/` 目前有认证、导入、任务 |
+| 复核界面 | #15 | 接口与存储都已落地，`frontend/` 还没有 |
 | 导入批次撤销 | 未定 | 只能按 answer_id 删；验收只要求"取消导入不产生数据"，已满足 |
-| 复核界面与人工改分 | #9 | 只有 `reviews` 表，没有读写它的代码 |
-| 自然语言 → 标准（HTTP 接口） | #13 | 生成逻辑已在 `app/rubric_gen.py`，但只有脚本入口，没有 REST |
+| 自然语言 → 标准（HTTP 接口） | #11 | 生成逻辑已在 `app/rubric_gen.py`，但只有脚本入口，没有 REST |
 | 分数校准 | 校准层 | `core/calibrate.py` **不存在**；`calibrated_score` 恒为 `NULL` |
 | 模型能力注册表 | 后续 | `providers/registry.py` **不存在** |
-| 前端 | #11–#14 | `frontend/` 目录不存在 |
+| 前端 | #12–#15 | `frontend/` 目录不存在 |
 | token / 耗时统计 | 后续 | `grading_runs.tokens_in/latency_ms` 列存在但恒为 `NULL` |
 
 ---
@@ -990,7 +1057,8 @@ Day 2（系统与工程）
   → ⑨ cli.py
   → tests/test_store.py + test_migrations.py（看"字段无损"和"迁移对齐"是怎么被守住的）
   → ⑩ app/main.py → app/auth.py → app/api/deps.py → app/api/routes.py
-  → docs/ticket-notes.md（看 #4 / #5 / #6 里那些被修掉的 bug，比读正常代码更快理解设计边界）
+  → ⑪ app/importing.py → ⑫ app/tasks.py → ⑬ store 的复核段 + app/api/results.py
+  → docs/ticket-notes.md（看 #4–#9 里那些被修掉的 bug，比读正常代码更快理解设计边界）
 ```
 
 **一个提高效率的习惯**：读每一节之前，先看那一层对应的测试类名。
@@ -1013,9 +1081,9 @@ Day 2（系统与工程）
 
 ---
 
-## 11. 读代码时容易撞上的六处"名不副实"
+## 11. 读代码时容易撞上的七处"名不副实"
 
-这三处不是 bug，但**只看代码或只看文档都会误解**。写论文、答辩、改代码之前先读一遍。
+这几处不是 bug，但**只看代码或只看文档都会误解**。写论文、答辩、改代码之前先读一遍。
 
 ### 11.1 `Deduction.cap`（封顶）当前不生效
 
@@ -1064,3 +1132,12 @@ Day 2（系统与工程）
 - **影响**：改了 `rubric.rules` 不会改变模型行为，也不会改变算分。看起来可配，实际不生效。
 - **状态**：占位字段。要让它生效，得把 `SYSTEM` 拆成按开关拼装——这是一个明确的小工单，
   但改提示词会牵动已有的方差实验结论（E1），所以没在这一票里顺手做。
+
+### 11.7 `route='auto'`（自动通过）不等于成绩已发布
+
+- **现象**：路由的 `auto` / `human` 只表示"系统认为不需要人工看"。要有一条 `reviews` 行
+  （逐份复核或批量通过）才算**定稿**；`aggregated_results` 里始终只有模型原分。
+- **影响**：以为 `auto` 就已经是最终成绩，会漏掉"批量通过"这一步；复核队列默认只列
+  `route='human'`，`auto` 那批要用 `GET /api/results?route=auto` 单独取。
+- **状态**：有意为之。自动通过是**免看**，不是**免确认**——教师仍要对整批结果负责。
+  这也是验收"支持批量通过一组高置信结果"落在的地方（架构 §2.3）。

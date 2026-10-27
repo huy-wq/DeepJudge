@@ -11,7 +11,13 @@ from fastapi.responses import JSONResponse
 
 from fastapi.exceptions import RequestValidationError
 
-from ..store import QuestionNotFound
+from ..store import (
+    QuestionNotFound,
+    ResultFinalized,
+    ResultNotFound,
+    ResultSuperseded,
+    ReviewRejected,
+)
 
 
 def register(app: FastAPI) -> None:
@@ -21,6 +27,39 @@ def register(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
             content={"detail": str(exc), "code": "QUESTION_NOT_FOUND"},
+        )
+
+    @app.exception_handler(ResultNotFound)
+    async def _result_not_found(request: Request, exc: ResultNotFound):
+        del request
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": str(exc), "code": "RESULT_NOT_FOUND"},
+        )
+
+    @app.exception_handler(ResultFinalized)
+    async def _result_finalized(request: Request, exc: ResultFinalized):
+        del request
+        # 409 而不是 400：请求本身没错，是"这份结果的状态不允许再做这件事"
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": str(exc), "code": "RESULT_FINALIZED"},
+        )
+
+    @app.exception_handler(ResultSuperseded)
+    async def _result_superseded(request: Request, exc: ResultSuperseded):
+        del request
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": str(exc), "code": "RESULT_SUPERSEDED"},
+        )
+
+    @app.exception_handler(ReviewRejected)
+    async def _review_rejected(request: Request, exc: ReviewRejected):
+        del request
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": str(exc), "code": "REVIEW_REJECTED"},
         )
 
     @app.exception_handler(RequestValidationError)

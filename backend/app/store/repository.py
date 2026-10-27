@@ -13,18 +13,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import Engine, create_engine, event, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
 from ..core.aggregate import Aggregate
 from ..core.normalize import hash_normalized, normalize_with_map
 from ..core.routing import RouteDecision
 from ..core.rubric import from_dict, to_dict
-from ..core.types import DeductionJudgement, ItemJudgement, Rubric, SampleJudgement
+from ..core.types import EPS, DeductionJudgement, ItemJudgement, Rubric, SampleJudgement
 from ..pipeline import Evaluation
 from .tables import (
     aggregated_results,
@@ -33,6 +36,7 @@ from .tables import (
     grading_tasks,
     item_results,
     questions,
+    reviews,
     rubrics,
     task_items,
 )
@@ -87,6 +91,30 @@ class QuestionNotFound(LookupError):
     """要导入的题号在库里不存在——通常是因为还没保存过这份评分标准。"""
 
 
+class ResultNotFound(LookupError):
+    """要复核的评分结果不存在。"""
+
+
+class ResultFinalized(Exception):
+    """这份结果已经有复核记录，即已定稿。
+
+    定稿是**一次**的：错误地改分或重复点击都不该悄悄覆盖一个已经成立的结论。
+    需要更正时走后续的撤销/重开流程（当前版本没有）。
+    """
+
+
+class ResultSuperseded(Exception):
+    """这份结果已被同一份答卷的重新评分取代，不该再定稿。
+
+    队列里已经把它藏起来；接口再挡一次，防止有人拿着旧页面的链接
+    把一个过期的结论"确认"成正式成绩。
+    """
+
+
+class ReviewRejected(ValueError):
+    """复核请求本身不成立：改分没有意见、分数越界、批量通过里混了待复核项。"""
+
+
 @dataclass(frozen=True)
 class ImportedAnswer:
     answer_id: int
@@ -122,6 +150,19 @@ class TaskItem:
     status: str
     error: str | None
     aggregate_id: int | None
+
+
+@dataclass(frozen=True)
+class ReviewRecord:
+    """一次复核：谁、把最终分定成多少、采纳还是改分、为什么。"""
+
+    review_id: int
+    aggregate_id: int
+    reviewer_id: str
+    final_score: float
+    decision: str
+    comment: str
+    created_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -195,6 +236,51 @@ def _span_columns(span: tuple[int, int] | None) -> dict[str, int | None]:
         "span_start": None,
         "span_end": None,
     }
+
+
+REVIEW_DECISIONS = {"accept", "override"}
+
+
+def _reviewed_score(
+    *, decision: str, given: float | None, raw: float, max_score: float
+) -> float:
+    """复核后的最终分：采纳时就是原分，改分时校验取值范围。"""
+    value: float | None = None
+    if given is not None:
+        try:
+            value = float(given)
+        except (TypeError, ValueError) as exc:
+            raise ReviewRejected("最终分必须是数字") from exc
+
+    # NaN 与 `value < 0`、`value > max_score` 两个比较都是 False，不挡住的话会一路写进库
+    # （SQLite 会把它存成 NULL），最后撞 NOT NULL 约束，报出来的却是"已定稿"——错误信息与事实完全不符。
+    if value is not None and not math.isfinite(value):
+        raise ReviewRejected("最终分必须是有限数值")
+
+    if decision == "accept":
+        if value is not None and abs(value - raw) > EPS:
+            raise ReviewRejected(
+                "采纳就是接受模型给的分；要改分请选择改分并写明理由"
+            )
+        return round(raw, 2)
+
+    if value is None:
+        raise ReviewRejected("改分必须给出最终分")
+    if value < 0 or value > max_score:
+        raise ReviewRejected(f"最终分必须在 0 到 {max_score:g} 之间")
+    return round(value, 2)
+
+
+def _review_record(row) -> ReviewRecord:
+    return ReviewRecord(
+        review_id=row["id"],
+        aggregate_id=row["aggregated_result_id"],
+        reviewer_id=row["reviewer_id"],
+        final_score=row["final_score"],
+        decision=row["decision"],
+        comment=row["comment"],
+        created_at=row["created_at"],
+    )
 
 
 class Store:
@@ -316,6 +402,19 @@ class Store:
             ).first()
             if row is None:
                 raise QuestionNotFound(f"答卷不存在：{answer_id}")
+            # 先锁住该答卷当前最新的聚合结果，再判"有没有定稿"。
+            # 复核走的是同一条记录上的 FOR UPDATE，两个方向因此串行化：
+            # 没有它，"复核先查后插"与"重评先查后插"可以同时通过检查（MySQL 下真实存在）。
+            # SQLite 会忽略 FOR UPDATE，但同一时刻只有一个写者，行为仍然一致。
+            conn.execute(
+                select(aggregated_results.c.id)
+                .where(aggregated_results.c.answer_id == answer_id)
+                .order_by(aggregated_results.c.id.desc())
+                .limit(1)
+                .with_for_update()
+            ).first()
+            if self._finalized_answer_ids(conn, [answer_id]):
+                raise ResultFinalized("这份答卷已经定稿，不能重新评分")
             question_id = row[0]
             if rubric_id is None:
                 rubric_id = self._ensure_rubric(conn, question_id, rubric)
@@ -757,6 +856,13 @@ class Store:
                     "这些答卷不存在或不属于题号 "
                     f"{question_code}：{'、'.join(str(i) for i in missing)}"
                 )
+            finalized = self._finalized_answer_ids(conn, answer_ids)
+            if finalized:
+                raise ValueError(
+                    "这些答卷已经定稿，不能重新评分："
+                    + "、".join(str(i) for i in finalized)
+                    + "（更正需要撤销定稿，当前版本没有该入口）"
+                )
 
             task_id = conn.execute(
                 grading_tasks.insert().values(
@@ -931,8 +1037,12 @@ class Store:
     def task_item_views(self, task_id: int) -> list[dict[str, Any]]:
         """任务里每份答卷的状态 + 分数 + 路由。
 
-        "待复核"不单独存状态：它就是 `aggregated_results.route == 'human'`，
+        "待复核""已定稿"不单独存状态：它们分别由 `route` 与有没有复核记录派生；
         存两份迟早会出现"状态说已评、路由说待复核"的自相矛盾。
+
+        `current` 表示这份任务项指向的聚合结果**是不是该答卷当前最新的结论**。
+        同一份答卷被另一个任务重新评分后，本任务仍保留当时那一行（任务级快照），
+        但它已经过期：接口要标出来，否则教师会对着一份无法定稿的旧分数找操作入口。
         """
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -946,16 +1056,35 @@ class Store:
                     aggregated_results.c.max_score,
                     aggregated_results.c.route,
                     aggregated_results.c.confidence,
+                    reviews.c.final_score,
                 )
                 .select_from(
-                    task_items.join(answers, task_items.c.answer_id == answers.c.id).outerjoin(
+                    task_items.join(answers, task_items.c.answer_id == answers.c.id)
+                    .outerjoin(
                         aggregated_results,
                         task_items.c.aggregate_id == aggregated_results.c.id,
+                    )
+                    .outerjoin(
+                        reviews, reviews.c.aggregated_result_id == aggregated_results.c.id
                     )
                 )
                 .where(task_items.c.task_id == task_id)
                 .order_by(task_items.c.id)
             ).all()
+
+            answer_ids = sorted({row[0] for row in rows})
+            latest = {}
+            if answer_ids:
+                latest = dict(
+                    conn.execute(
+                        select(
+                            aggregated_results.c.answer_id, func.max(aggregated_results.c.id)
+                        )
+                        .where(aggregated_results.c.answer_id.in_(answer_ids))
+                        .group_by(aggregated_results.c.answer_id)
+                    ).all()
+                )
+
         return [
             {
                 "answer_id": row[0],
@@ -963,10 +1092,13 @@ class Store:
                 "status": row[2],
                 "error": row[3],
                 "aggregate_id": row[4],
+                # 没有聚合结果（pending/running/failed）时无所谓"过期"，算当前
+                "current": row[4] is None or latest.get(row[0]) == row[4],
                 "score": row[5],
                 "max_score": row[6],
                 "route": row[7],
                 "confidence": row[8],
+                "final_score": row[9],
             }
             for row in rows
         ]
@@ -1041,22 +1173,351 @@ class Store:
                 self._recount(conn, task_id)
         return len(running)
 
+    # ------------------------------------------------------------------ 复核
+
+    def _result_conditions(
+        self,
+        *,
+        route: str | None,
+        pending: bool,
+        question_code: str | None,
+    ) -> list:
+        """队列与计数共用同一套筛选条件，否则"共 12 份"和列出来的 10 份对不上。"""
+        # 待办只看"当前结论"：同一份答卷被重新评分过时，旧聚合结果不再进队列，
+        # 否则教师会对一份已经被取代的分数定稿。
+        # 已定稿列表相反——它是历史，不该被"最新一次"过滤掉。
+        conditions = []
+        if pending:
+            latest_ids = select(func.max(aggregated_results.c.id)).group_by(
+                aggregated_results.c.answer_id
+            )
+            conditions.append(aggregated_results.c.id.in_(latest_ids))
+            conditions.append(reviews.c.id.is_(None))
+        else:
+            conditions.append(reviews.c.id.is_not(None))
+        if route is not None:
+            conditions.append(aggregated_results.c.route == route)
+        if question_code is not None:
+            conditions.append(questions.c.code == question_code)
+        return conditions
+
+    def _result_query(self):
+        return (
+            aggregated_results.join(answers, aggregated_results.c.answer_id == answers.c.id)
+            .join(questions, answers.c.question_id == questions.c.id)
+            .outerjoin(reviews, reviews.c.aggregated_result_id == aggregated_results.c.id)
+        )
+
+    def list_results(
+        self,
+        *,
+        route: str | None = "human",
+        pending: bool = True,
+        question_code: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """列评分结果，默认只给"待人工处理"的那些。
+
+        排序用 `risk`（极差 + 低置信度折算），只在同一批次内可比——它没有理论依据，
+        只回答"先看哪一份"。`pending` 不写进表里：有复核记录就是已定稿，
+        存一个布尔迟早与 reviews 表对不上。
+        """
+        conditions = self._result_conditions(
+            route=route, pending=pending, question_code=question_code
+        )
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(
+                    aggregated_results.c.id,
+                    aggregated_results.c.answer_id,
+                    answers.c.student_pseudo_id,
+                    questions.c.code,
+                    aggregated_results.c.raw_score,
+                    aggregated_results.c.max_score,
+                    aggregated_results.c.route,
+                    aggregated_results.c.risk,
+                    aggregated_results.c.confidence,
+                    aggregated_results.c.dispersion,
+                    aggregated_results.c.total_range,
+                    aggregated_results.c.grounding_rate,
+                    aggregated_results.c.reasons_json,
+                    aggregated_results.c.created_at,
+                    reviews.c.id,
+                    reviews.c.final_score,
+                )
+                .select_from(self._result_query())
+                .where(*conditions)
+                # risk 只在一份标准内可比（架构 §2.2），所以先按题号分组、组内按 risk 排。
+                # 跨题混排再按 risk 排会把"不可比"的数字放在一起比较。
+                .order_by(
+                    questions.c.code,
+                    aggregated_results.c.risk.desc(),
+                    aggregated_results.c.id,
+                )
+                .limit(limit)
+                .offset(offset)
+            ).all()
+        return [
+            {
+                "aggregate_id": row[0],
+                "answer_id": row[1],
+                "pseudo_id": row[2],
+                "question_code": row[3],
+                "raw_score": row[4],
+                "final_score": row[15],
+                "max_score": row[5],
+                "route": row[6],
+                "risk": row[7],
+                "confidence": row[8],
+                "dispersion": row[9],
+                "total_range": row[10],
+                "grounding_rate": row[11],
+                "reasons": list(row[12]),
+                "created_at": row[13],
+                "reviewed": row[14] is not None,
+            }
+            for row in rows
+        ]
+
+    def count_results(
+        self,
+        *,
+        route: str | None = "human",
+        pending: bool = True,
+        question_code: str | None = None,
+    ) -> int:
+        """队列总数。与 `list_results` 用同一套条件，只是不取明细。"""
+        conditions = self._result_conditions(
+            route=route, pending=pending, question_code=question_code
+        )
+        with self._engine.connect() as conn:
+            return conn.execute(
+                select(func.count()).select_from(self._result_query()).where(*conditions)
+            ).scalar_one()
+
+    def latest_aggregate_id(self, answer_id: int) -> int | None:
+        """该答卷最近一次评分的聚合结果号；详情页用它判断"是否已被取代"。"""
+        with self._engine.connect() as conn:
+            return conn.execute(
+                select(func.max(aggregated_results.c.id)).where(
+                    aggregated_results.c.answer_id == answer_id
+                )
+            ).scalar_one_or_none()
+
+    def load_review(self, aggregate_id: int) -> ReviewRecord | None:
+        with self._engine.connect() as conn:
+            return self._review_of(conn, aggregate_id)
+
+    def record_review(
+        self,
+        aggregate_id: int,
+        *,
+        decision: str,
+        final_score: float | None = None,
+        comment: str = "",
+        reviewer_id: str = "admin",
+    ) -> ReviewRecord:
+        """给一份结果定稿：采纳原分或改分。
+
+        最终分写进 `reviews`，**不改写** `aggregated_results.raw_score`：
+        模型当时给了多少是一份证据，人工改成多少是另一份证据，两份都要留着。
+        """
+        if decision not in REVIEW_DECISIONS:
+            raise ReviewRejected("decision 只能是 accept 或 override")
+        comment = comment.strip()
+        if decision == "override" and not comment:
+            raise ReviewRejected("改分必须写明理由：没有意见的改分无法解释")
+
+        with self._engine.begin() as conn:
+            # FOR UPDATE 与 save_evaluation_for_answer 抢同一行，见那边的注释。
+            aggregate = conn.execute(
+                select(
+                    aggregated_results.c.raw_score,
+                    aggregated_results.c.max_score,
+                    aggregated_results.c.answer_id,
+                )
+                .where(aggregated_results.c.id == aggregate_id)
+                .with_for_update()
+            ).first()
+            if aggregate is None:
+                raise ResultNotFound(f"评分结果不存在：{aggregate_id}")
+            self._require_current(conn, aggregate_id, aggregate[2])
+            if self._review_of(conn, aggregate_id) is not None:
+                raise ResultFinalized("这份结果已经定稿，不能重复复核")
+
+            final = _reviewed_score(
+                decision=decision,
+                given=final_score,
+                raw=aggregate[0],
+                max_score=aggregate[1],
+            )
+            try:
+                conn.execute(
+                    reviews.insert().values(
+                        aggregated_result_id=aggregate_id,
+                        reviewer_id=reviewer_id,
+                        final_score=final,
+                        decision=decision,
+                        comment=comment,
+                    )
+                )
+            except IntegrityError as exc:
+                # 唯一索引兜底：并发重复提交时，第二次在这里被挡住。
+                # 这条 INSERT 上只有 uq_reviews_aggregate 一个约束（外键目标已在上方锁定并查到），
+                # 所以 IntegrityError 在这里就只可能是"已经定稿"。
+                raise ResultFinalized("这份结果已经定稿，不能重复复核") from exc
+            inserted = self._review_of(conn, aggregate_id)
+        if inserted is None:  # pragma: no cover - 刚插进去就没了说明库坏了
+            raise ResultNotFound(f"评分结果不存在：{aggregate_id}")
+        return inserted
+
+    def accept_high_confidence(
+        self,
+        aggregate_ids: list[int],
+        *,
+        comment: str = "",
+        reviewer_id: str = "admin",
+    ) -> list[ReviewRecord]:
+        """批量通过自动路由的结果。
+
+        **只接受 `route == 'auto'` 的**：转人工的结果必须逐份看，
+        否则"批量通过"就成了绕过路由的后门。整批是一个事务——
+        混进一份不合格的，整批不落库，避免"通过了一半"这种说不清的状态。
+        """
+        ids = list(dict.fromkeys(aggregate_ids))
+        if not ids:
+            raise ReviewRejected("至少要选一份结果")
+
+        with self._engine.begin() as conn:
+            # 与单份复核、重评抢同一批行：批量通过也要在锁内做"是否过期"的判断，
+            # 否则检查通过之后、插入之前，另一条重评可以插进更新的聚合结果。
+            rows = conn.execute(
+                select(
+                    aggregated_results.c.id,
+                    aggregated_results.c.raw_score,
+                    aggregated_results.c.route,
+                    aggregated_results.c.answer_id,
+                )
+                .where(aggregated_results.c.id.in_(ids))
+                .with_for_update()
+            ).all()
+            found = {row[0]: row for row in rows}
+            missing = [str(aggregate_id) for aggregate_id in ids if aggregate_id not in found]
+            if missing:
+                raise ReviewRejected("这些评分结果不存在：" + "、".join(missing))
+
+            needs_review = [
+                str(aggregate_id) for aggregate_id in ids if found[aggregate_id][2] != "auto"
+            ]
+            if needs_review:
+                raise ReviewRejected(
+                    "这些结果需要逐份复核，不能批量通过：" + "、".join(needs_review)
+                )
+
+            for aggregate_id in ids:
+                self._require_current(conn, aggregate_id, found[aggregate_id][3])
+
+            finalized = conn.execute(
+                select(reviews.c.aggregated_result_id).where(
+                    reviews.c.aggregated_result_id.in_(ids)
+                )
+            ).scalars().all()
+            if finalized:
+                raise ResultFinalized(
+                    "这些结果已经定稿：" + "、".join(str(item) for item in finalized)
+                )
+
+            try:
+                conn.execute(
+                    reviews.insert(),
+                    [
+                        {
+                            "aggregated_result_id": aggregate_id,
+                            "reviewer_id": reviewer_id,
+                            "final_score": round(found[aggregate_id][1], 2),
+                            "decision": "accept",
+                            "comment": comment.strip(),
+                        }
+                        for aggregate_id in ids
+                    ],
+                )
+            except IntegrityError as exc:
+                # 与单份复核同理：唯一索引兜底，并发时整批回滚而不是只进一半
+                raise ResultFinalized("这些结果中有已经定稿的，请刷新后重试") from exc
+            inserted = conn.execute(
+                select(reviews)
+                .where(reviews.c.aggregated_result_id.in_(ids))
+                .order_by(reviews.c.id)
+            ).mappings().all()
+        return [_review_record(row) for row in inserted]
+
+    def _finalized_answer_ids(self, conn, answer_ids: list[int]) -> list[int]:
+        """这些答卷里，哪些已经有定稿记录（不看是哪一次结论）。"""
+        if not answer_ids:
+            return []
+        return conn.execute(
+            select(aggregated_results.c.answer_id)
+            .distinct()
+            .select_from(
+                reviews.join(
+                    aggregated_results,
+                    reviews.c.aggregated_result_id == aggregated_results.c.id,
+                )
+            )
+            .where(aggregated_results.c.answer_id.in_(answer_ids))
+        ).scalars().all()
+
+    def _require_current(self, conn, aggregate_id: int, answer_id: int) -> None:
+        latest = conn.execute(
+            select(func.max(aggregated_results.c.id)).where(
+                aggregated_results.c.answer_id == answer_id
+            )
+        ).scalar_one()
+        if latest != aggregate_id:
+            raise ResultSuperseded(
+                "这份结果已被重新评分取代，请复核最新一次结果"
+            )
+
+    def _review_of(self, conn, aggregate_id: int) -> ReviewRecord | None:
+        row = conn.execute(
+            select(reviews).where(reviews.c.aggregated_result_id == aggregate_id)
+        ).mappings().first()
+        return None if row is None else _review_record(row)
+
     # ------------------------------------------------------------------ 读取
 
     def load_evaluation(
-        self, *, answer_id: int | None = None, run_id: int | None = None
+        self,
+        *,
+        answer_id: int | None = None,
+        run_id: int | None = None,
+        aggregate_id: int | None = None,
     ) -> StoredEvaluation | None:
-        """按答卷号或运行号读回完整结果。
+        """按答卷号、运行号或聚合结果号读回完整结果。
 
         - 按答卷号：取该答卷**最新**的聚合结果（重评一次就多一行，最新即当前结论）。
         - 按运行号：取**包含这一次运行**的那次聚合。不能图省事取最新——重评之后，
           这条运行和最新结论已经不是一回事了，硬拿最新的会把两次评分混成一次。
+        - 按聚合结果号：复核详情用。复核是针对**某一次结论**的，不能拿"该答卷最新一次"
+          顶替——那份可能已经是另一次重评了。
         """
-        if (answer_id is None) == (run_id is None):
-            raise ValueError("answer_id 与 run_id 必须且只能给一个")
+        if sum(item is not None for item in (answer_id, run_id, aggregate_id)) != 1:
+            raise ValueError("answer_id、run_id 与 aggregate_id 必须且只能给一个")
 
         with self._engine.connect() as conn:
-            if answer_id is None:
+            aggregate_row = None
+            if aggregate_id is not None:
+                aggregate_row = conn.execute(
+                    select(aggregated_results).where(
+                        aggregated_results.c.id == aggregate_id
+                    )
+                ).mappings().first()
+                if aggregate_row is None:
+                    return None
+                answer_id = aggregate_row["answer_id"]
+            elif run_id is not None:
                 run = conn.execute(
                     select(grading_runs.c.answer_id).where(grading_runs.c.id == run_id)
                 ).first()
@@ -1070,9 +1531,10 @@ class Store:
             if answer is None:
                 return None
 
-            aggregate_row = self._find_aggregate(conn, answer_id, run_id)
             if aggregate_row is None:
-                return None
+                aggregate_row = self._find_aggregate(conn, answer_id, run_id)
+                if aggregate_row is None:
+                    return None
 
             rubric_row = conn.execute(
                 select(rubrics).where(rubrics.c.id == aggregate_row["rubric_id"])

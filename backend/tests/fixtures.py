@@ -88,3 +88,16 @@ def payload_text(**overrides) -> str:
     data = json.loads(json.dumps(SAMPLE_PAYLOAD))
     data.update(overrides)
     return json.dumps(data, ensure_ascii=False)
+
+
+def payload_with_levels(*levels) -> str:
+    """固定三个采分点的等级，生成一次采样的模型输出。"""
+    data = json.loads(payload_text())
+    for item, level in zip(data["items"], levels):
+        item["level"] = level
+    return json.dumps(data, ensure_ascii=False)
+
+
+# 两次采样差异越大，总分极差越大 → risk 越高（risk 只用于复核队列排序）
+MILD_DISAGREEMENT = [payload_with_levels(1, 1, 1), payload_with_levels(0, 1, 1)]  # risk 7
+STRONG_DISAGREEMENT = [payload_with_levels(1, 0, 0), payload_with_levels(0, 1, 1)]  # risk 15

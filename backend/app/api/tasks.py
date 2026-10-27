@@ -16,13 +16,21 @@ from .schemas import CreateTaskRequest, RetryRequest
 
 
 def _state_of(item: dict) -> str:
-    """把"逐份状态"翻译成教师能直接看的一种状态（验收要求三态：已评/失败/待复核）。
+    """把"逐份状态"翻译成教师能直接看的一种状态：已评 / 待复核 / 已定稿 / 失败 / 进行中。
 
     `task_items.status` 只有 pending/running/graded/failed；"待复核"是
-    `route == 'human'` 派生出来的。**派生放在服务端**：让前端自己拼 status + route，
-    迟早出现两个页面拼法不一致。数据库里仍然不存这个状态（存两份必然对不上）。
+    `route == 'human'` 派生出来的，"已定稿"是"存在复核记录"派生出来的。
+    **派生放在服务端**：让前端自己拼 status + route + final_score，
+    迟早出现两个页面拼法不一致。数据库里仍然不存这些状态（存两份必然对不上）。
+
+    判定顺序：过期 → 已定稿 → 待复核。定稿之后即使当时是转人工的，也不该继续显示"待复核"；
+    而一份已过期的结论既不能复核（409）也不该被当成当前成绩，所以它排在最前面。
     """
     if item["status"] == "graded":
+        if not item["current"]:
+            return "superseded"
+        if item["final_score"] is not None:
+            return "finalized"
         return "needs_review" if item["route"] == "human" else "graded"
     return item["status"]
 

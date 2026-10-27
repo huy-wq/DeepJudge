@@ -30,7 +30,9 @@ def describe_metadata() -> dict:
     for name, table in metadata.tables.items():
         described[name] = {
             "columns": {(c.name, bool(c.nullable)) for c in table.columns},
-            "indexes": {index.name for index in table.indexes},
+            # 带上 unique 标志：唯一索引与非唯一索引承担完全不同的约束，
+            # 只比名字的话"唯一性没建出来"也能通过
+            "indexes": {(index.name, bool(index.unique)) for index in table.indexes},
             "uniques": {
                 tuple(sorted(column.name for column in constraint.columns))
                 for constraint in table.constraints
@@ -57,7 +59,9 @@ def describe_database(url: str) -> dict:
             continue
         described[name] = {
             "columns": {(c["name"], bool(c["nullable"])) for c in inspector.get_columns(name)},
-            "indexes": {i["name"] for i in inspector.get_indexes(name)},
+            "indexes": {
+                (i["name"], bool(i.get("unique"))) for i in inspector.get_indexes(name)
+            },
             "uniques": {
                 tuple(sorted(c["column_names"]))
                 for c in inspector.get_unique_constraints(name)

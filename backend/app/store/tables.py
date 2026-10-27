@@ -286,7 +286,9 @@ reviews = Table(
     Column("decision", String(16), nullable=False, comment="accept 采纳 / override 改分"),
     Column("comment", LongText, nullable=False),
     Column("created_at", DateTime, nullable=False, server_default=func.now()),
-    Index("ix_reviews_aggregate", "aggregated_result_id"),
+    # 一份结果只定稿一次：重复提交由数据库兜底，不靠"先查再插"的窗口。
+    # 用唯一索引而不是 UniqueConstraint，是为了让 SQLite 上的迁移不必重建整张表。
+    Index("uq_reviews_aggregate", "aggregated_result_id", unique=True),
     **MYSQL_TABLE_ARGS,
 )
 

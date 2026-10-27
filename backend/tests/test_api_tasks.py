@@ -110,6 +110,50 @@ class CreateAndPoll(TaskApiTestCase):
         self.assertEqual(final["items"][0]["route"], "auto")
         self.assertIsNotNone(final["items"][0]["score"])
 
+    def test_finalized_result_shows_up_as_finalized_on_the_task(self):
+        answer_ids = self.import_answers([ANSWER])
+        created = self.client.post(
+            "/api/tasks",
+            json={"question_code": "Q-01", "answer_ids": answer_ids, "samples": 1},
+        ).json()
+        item = self.wait_for(created["task_id"])["items"][0]
+
+        accepted = self.client.post(
+            "/api/results/batch-accept", json={"aggregate_ids": [item["aggregate_id"]]}
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+
+        refreshed = self.client.get(f"/api/tasks/{created['task_id']}").json()["items"][0]
+        self.assertEqual(refreshed["state"], "finalized")
+        self.assertEqual(refreshed["final_score"], item["score"])
+        self.assertEqual(refreshed["score"], item["score"])  # 模型原分仍然保留
+
+    def test_regraded_answer_leaves_the_old_task_item_marked_superseded(self):
+        answer_ids = self.import_answers([ANSWER])
+        first = self.client.post(
+            "/api/tasks",
+            json={"question_code": "Q-01", "answer_ids": answer_ids, "samples": 1},
+        ).json()
+        self.wait_for(first["task_id"])
+        second = self.client.post(
+            "/api/tasks",
+            json={"question_code": "Q-01", "answer_ids": answer_ids, "samples": 1},
+        ).json()
+        self.wait_for(second["task_id"])
+
+        current_item = self.client.get(f"/api/tasks/{second['task_id']}").json()["items"][0]
+        self.assertTrue(current_item["current"])
+        accepted = self.client.post(
+            "/api/results/batch-accept",
+            json={"aggregate_ids": [current_item["aggregate_id"]]},
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+
+        stale_item = self.client.get(f"/api/tasks/{first['task_id']}").json()["items"][0]
+        self.assertEqual(stale_item["state"], "superseded")
+        self.assertFalse(stale_item["current"])
+        self.assertIsNone(stale_item["final_score"])
+
     def test_unknown_task_is_404(self):
         self.assertEqual(self.client.get("/api/tasks/9999").status_code, 404)
 

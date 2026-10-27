@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -46,3 +48,19 @@ class RetryRequest(BaseModel):
     answer_ids: list[int] = Field(
         default_factory=list, description="只重试这几份；空表示本任务全部失败项"
     )
+
+
+# ---------------------------------------------------------------- 复核
+class ReviewRequest(BaseModel):
+    decision: Literal["accept", "override"] = Field(
+        default="accept", description="accept 采纳原分 / override 改分"
+    )
+    final_score: float | None = Field(
+        default=None, description="改分后的最终分；采纳时不传"
+    )
+    comment: str = Field(default="", description="复核意见；改分时必填")
+
+
+class BatchAcceptRequest(BaseModel):
+    aggregate_ids: list[int] = Field(min_length=1, description="要批量通过的评分结果编号")
+    comment: str = Field(default="", description="整批共用的说明")
