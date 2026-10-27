@@ -20,7 +20,7 @@ const steps = [
   },
   {
     title: '3 复核',
-    description: '按风险查看需要人工确认的结论，先处理最可疑的那几份。',
+    description: '按风险查看待确认结论，点证据回原文高亮，改分或批量通过后定稿。',
     to: '/review',
     action: '打开复核队列',
   },

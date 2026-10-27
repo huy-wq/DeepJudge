@@ -8,7 +8,7 @@
 
 **当前状态**：317 个后端用例（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
 裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归）
-+ 73 个前端用例（Vitest + jsdom，见 §2 ⑮/⑯/⑰），约 2.4 万行（含文档、测试与锁文件）。
++ 83 个前端用例（Vitest + jsdom，见 §2 ⑮/⑯/⑰/⑱），约 2.4 万行（含文档、测试与锁文件）。
 已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成、#11 标准保存与迭代、#12 前端骨架、#13 标准编辑页、#14 导入与任务页。
 **没有**的部分见 §8，别在代码里找不存在的东西。
 
@@ -59,8 +59,8 @@ frontend/                ← 管理端（Vue 3 + Vite + TS + Element Plus）
 │                          grading/ 导入预览与任务进度
 ├── src/layouts/         ← AdminLayout
 ├── src/views/           ← 登录 / 首页 / 标准列表 / 标准编辑 / 导入与评分 /
-│                          复核队列 / 404 / 加载失败
-├── tests/               ← 73 个用例（Vitest + jsdom）
+│                          复核队列 / 复核详情 / 404 / 加载失败
+├── tests/               ← 83 个用例（Vitest + jsdom）
 └── vite.config.ts       ← dev proxy /api → :8000；Vitest 配置
 
 仓库根目录还有：docker-compose.yml（本地 MySQL 8）、scripts/dev-db.sh（一键起库 + 迁移）。
@@ -882,7 +882,7 @@ python3 -m unittest tests.test_api_rubrics -v    # 26 个用例：生成 → 保
 
 ### ⑮ 前端骨架：`frontend/`（约 30 分钟）
 
-**职责**：登录、路由、把错误说清楚；标准编辑、导入与评分、复核队列分别在 ⑯/⑰ 与 #15。
+**职责**：登录、路由、把错误说清楚；标准编辑、导入与评分、复核队列与详情分别在 ⑯/⑰/⑱。
 
 | 位置 | 在干什么 | 读的时候注意 |
 | --- | --- | --- |
@@ -915,7 +915,7 @@ python3 -m unittest tests.test_api_rubrics -v    # 26 个用例：生成 → 保
 ```bash
 cd frontend
 npm install
-npm run test        # 73 个用例：守卫、会话、标准编辑、导入与任务、复核队列、统一错误、退出
+npm run test        # 83 个用例：守卫、会话、标准编辑、导入与任务、复核队列与详情、统一错误、退出
 npm run typecheck
 npm run build
 ```
@@ -994,21 +994,68 @@ npm run test -- tests/rubric-list.test.ts      # 3 个用例：列表、打开�
    `/grading?task=12` 让刷新、前进后退、从复核页返回都能接上同一个任务；代价是没有任务
    历史列表——换一个任务就找不到旧的，只能从复核队列或数据库找回。
 
-3. **复核页先只做队列。**
-   `/review` 是任务完成后的交接目标：按风险列出待复核结论与原因，但证据高亮、改分、
-   批量通过仍在 #15。不要在 #14 的队列页里找"定稿"按钮。
+3. **复核页拆成队列与详情。**
+   `/review` 只负责"先看哪几份"；证据高亮、改分与批量通过在 ⑱。任务完成后的交接链接
+   会带上题号，队列就只显示这道题。
 
 **动手验证**：
 
 ```bash
 cd frontend
 npm run test -- tests/grading.test.ts       # 15 个用例：预览/查重/粘贴/切题/发起/轮询/重试/跳转
-npm run test -- tests/review-queue.test.ts  # 4 个用例：风险列表、题号筛选、空状态、失败态
+npm run test -- tests/review-queue.test.ts  # 8 个用例：风险列表、题号筛选、自动通过页签、批量确认、空状态、失败态
 ```
 
 **读完要能回答**：为什么任务页不自己算"已评 / 待复核 / 已定稿"？
 （这些状态由服务端从 `status`、`route`、`current`、`final_score` 派生；前端再拼一份，
 两个页面迟早拼法不一致。）
+
+---
+
+### ⑱ 复核队列与详情：`ReviewQueueView.vue` / `ReviewDetailView.vue` + `api/results.ts`（约 30 分钟）
+
+**职责**：队列回答"先看哪几份"，详情回答"这一分怎么来的"，最后把结论定稿。
+
+| 位置 | 在干什么 | 读的时候注意 |
+| --- | --- | --- |
+| `api/results.ts` | 队列 / 详情 / 单份复核 / 批量通过的类型与调用 | 详情按 `aggregate_id`，不是 `answer_id` |
+| `ReviewQueueView.vue:34` `load` | 按页签（`human` / `auto`）取队列 | 请求序号防过期响应；前端不再排序，顺序以服务端为准 |
+| `:92` `openRow` | 打开某一次结论 | 旧结论也能打开，详情自己会标"已被取代" |
+| `:96` `submitBatch` | 批量通过自动结果 | 只接受 `route='auto'`；确认框写明份数与"按模型原分" |
+| `ReviewDetailView.vue:103` `load` | 读详情并按 `current` / `review` 决定能否操作 | `current=false` 时不给表单；`review` 存在时只展示结论 |
+| `:118` `showEvidence` | 把该行 `span` 设成高亮区间 | 高亮直接切原文，不在前端重新搜证据 |
+| `:127` `submit` | `accept` 或 `override` 定稿 | 改分要求意见 + 分数有变化；采纳原分意见可空 |
+| `:156` `back` | 回队列并带上题号 | 返回时队列重新挂载，已定稿的自然消失 |
+| `components/...` | 无 | 详情页本身足够独立，没有再抽子组件 |
+
+**四处必须看出的设计**：
+
+1. **批量通过只出现在 `auto` 页签。**
+   服务端的 `accept_high_confidence` 只收 `route='auto'`；页面如果允许全选待复核结果，
+   只会换回一个 400。待复核必须逐份打开看证据，这正是"人工复核"的意义。
+
+2. **详情按"某一次结论"打开，不按答卷。**
+   同一份答卷可能被重评多次。按 `answer_id` 打开只能拿到最新一次，旧链接就说不清当时看的是什么；
+   按 `aggregate_id` 才能明确回答"这是不是当前成绩"（`current` / `superseded_by`）。
+
+3. **高亮用服务端 `span`，前端不重新定位。**
+   证据接地时已经算好原文偏移；前端再搜一遍等于两份定位逻辑，短证据/模糊匹配迟早不一致。
+   代价是未接地的判定没有 `span`，只能显示"未定位"。
+
+4. **定稿后停在详情页。**
+   页面同时显示"已定稿 + 最终分 + 意见"，教师不用跳走后再猜有没有成功；回队列时重新请求，
+   已定稿的结果因为 `pending=true` 不再出现。
+
+**动手验证**：
+
+```bash
+cd frontend
+npm run test -- tests/review-queue.test.ts   # 8 个用例：风险列表、题号筛选、自动通过页签、批量确认、空状态、失败态
+npm run test -- tests/review-detail.test.ts  # 6 个用例：证据高亮、改分必填意见、采纳原分、已取代、已定稿
+```
+
+**读完要能回答**：为什么"批量通过"不能接受 `route='human'` 的结果？
+（转人工的结果必须逐份看证据；允许批量通过就等于绕过了路由，把低置信结论直接变成成绩。）
 
 ---
 
@@ -1105,7 +1152,8 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 | `tests/rubric-editor.test.ts` | 14 | 三视图同屏、改行后实时校验、阻断禁用保存、提示需确认、校验失败禁用保存、摘要随编辑更新、迭代/保存互斥、离开确认 |
 | `tests/rubric-list.test.ts` | 3 | 列表、打开某一版、空状态 |
 | `tests/grading.test.ts` | 15 | 预览/查重/坏行/学号不回显、文件自动预览、粘贴题号、CSV 切题、勾选发起、轮询与失败续刷、重试、任务恢复、跳转复核 |
-| `tests/review-queue.test.ts` | 4 | 按风险列队列与原因、题号筛选、空状态、加载失败 |
+| `tests/review-queue.test.ts` | 8 | 按风险列队列与原因、题号筛选、自动通过页签、批量确认/取消、打开详情、空状态、加载失败 |
+| `tests/review-detail.test.ts` | 6 | 证据高亮、改分必填意见、采纳原分、已取代、已定稿 |
 
 **测试里的接缝（seam）**，读懂这三个就够了：
 
@@ -1249,7 +1297,7 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 
 | 缺什么 | 属于哪张工单 | 现状 |
 | --- | --- | --- |
-| 复核详情与定稿 | #15 | 队列列表已在 `/review`；证据高亮、改分、批量通过还没有 |
+| 定稿历史 | 未定 | 队列只查 `pending=true`；要看已定稿历史需要另加入口 |
 | 导入批次撤销 | 未定 | 只能按 answer_id 删；验收只要求"取消导入不产生数据"，已满足 |
 | 分数校准 | 校准层 | `core/calibrate.py` **不存在**；`calibrated_score` 恒为 `NULL` |
 | 模型能力注册表 | 后续 | `providers/registry.py` **不存在** |

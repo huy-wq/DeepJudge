@@ -56,6 +56,12 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('../views/ReviewQueueView.vue'),
       },
       {
+        // 数字 id 才走详情，避免与 /review 抢路由
+        path: 'review/:id(\\d+)',
+        name: 'review-detail',
+        component: () => import('../views/ReviewDetailView.vue'),
+      },
+      {
         path: 'rubrics/new',
         name: 'rubric-new',
         component: () => import('../views/RubricEditorView.vue'),
