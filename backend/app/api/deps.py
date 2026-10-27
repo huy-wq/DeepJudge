@@ -9,6 +9,9 @@ from __future__ import annotations
 from fastapi import HTTPException, Request, status
 
 from ..auth import SESSION_COOKIE, AdminAuth, AuthError, Session
+from ..store import Store
+
+DATABASE_MISSING = "数据库未配置：设置 DATABASE_URL 后执行 alembic upgrade head"
 
 
 def get_auth(request: Request) -> AdminAuth:
@@ -32,3 +35,16 @@ def require_admin(request: Request) -> Session:
             detail="未登录或会话已失效",
             headers={"WWW-Authenticate": "Cookie"},
         ) from exc
+
+
+def require_store(request: Request) -> Store:
+    """业务接口的依赖：没有数据库就 503，并说清楚怎么配。
+
+    不把"没配数据库"直接变成启动失败，是为了让认证与前端骨架在没有 MySQL 的机器上也能跑。
+    """
+    store = getattr(request.app.state, "store", None)
+    if store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=DATABASE_MISSING
+        )
+    return store

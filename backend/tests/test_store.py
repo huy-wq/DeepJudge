@@ -15,11 +15,11 @@ except ImportError:  # pragma: no cover - 仅在没装依赖的裸环境下触�
         "未安装 sqlalchemy，先执行：python3 -m venv .venv && .venv/bin/pip install -e backend"
     )
 
-from app.core.normalize import normalize_with_map
+from app.core.normalize import content_hash, normalize_with_map
 from app.core.rubric import from_dict
 from app.pipeline import evaluate
 from app.providers.fake import CannedProvider
-from app.store import RunMeta, Store
+from app.store import QuestionNotFound, RunMeta, Store
 from tests.fixtures import ANSWER, RUBRIC_DATA, payload_text
 from tests.support import create_schema
 
@@ -182,6 +182,78 @@ class UnknownId(StoreTestCase):
     def test_missing_ids_return_none(self):
         self.assertIsNone(self.store.load_evaluation(answer_id=999))
         self.assertIsNone(self.store.load_evaluation(run_id=999))
+
+
+class ImportAnswers(StoreTestCase):
+    def setUp(self):
+        super().setUp()
+        # 先存一份标准，题目才会存在
+        self.save()
+
+    def test_imports_rows_and_assigns_pseudo_ids_in_order(self):
+        outcome = self.store.import_answers(
+            [("Q-01", "第一份"), ("Q-01", "第二份")], source="csv"
+        )
+
+        self.assertEqual(outcome.skipped_duplicates, 0)
+        self.assertEqual([item.pseudo_id for item in outcome.imported], ["S-0001", "S-0002"])
+        self.assertEqual(self.store.count_answers("Q-01"), 3)   # 1 份来自 save()
+
+    def test_duplicates_are_skipped_by_normalised_content(self):
+        self.store.import_answers([("Q-01", "客户端发送 SYN")], source="csv")
+
+        outcome = self.store.import_answers(
+            [("Q-01", "  客户端发送  SYN  ")], source="csv"
+        )
+
+        self.assertEqual(outcome.imported, [])
+        self.assertEqual(outcome.skipped_duplicates, 1)
+
+    def test_duplicates_inside_one_batch_are_skipped_too(self):
+        outcome = self.store.import_answers(
+            [("Q-01", "同一份"), ("Q-01", "同一份")], source="csv"
+        )
+
+        self.assertEqual(len(outcome.imported), 1)
+        self.assertEqual(outcome.skipped_duplicates, 1)
+
+    def test_unknown_question_is_rejected_and_nothing_is_written(self):
+        with self.assertRaises(QuestionNotFound) as ctx:
+            self.store.import_answers(
+                [("Q-01", "好的一行"), ("Q-99", "题号不存在")], source="csv"
+            )
+        self.assertIn("Q-99", str(ctx.exception))
+        self.assertEqual(self.store.count_answers("Q-01"), 1)   # 只留下 setUp 那份
+
+    def test_find_duplicates_matches_by_question_and_content(self):
+        self.store.import_answers([("Q-01", "重复的答案")], source="csv")
+        digest = content_hash("重复的答案")
+
+        found = self.store.find_duplicates([("Q-01", digest), ("Q-02", digest)])
+
+        self.assertEqual(found, {("Q-01", digest)})
+
+    def test_empty_batch_writes_nothing(self):
+        outcome = self.store.import_answers([], source="csv")
+
+        self.assertEqual(outcome.imported, [])
+        self.assertEqual(self.store.count_answers("Q-01"), 1)
+
+    def test_get_question_returns_the_standard_it_was_created_with(self):
+        question = self.store.get_question("Q-01")
+
+        self.assertEqual(question["code"], "Q-01")
+        self.assertEqual(question["total_score"], 10)
+        self.assertIsNone(self.store.get_question("Q-99"))
+
+    def test_list_answers_reports_pseudo_id_and_source(self):
+        self.store.import_answers([("Q-01", "导入的答卷")], source="csv")
+
+        rows = self.store.list_answers("Q-01")
+
+        self.assertEqual([row["pseudo_id"] for row in rows], ["anon", "S-0001"])
+        self.assertEqual(rows[1]["source"], "csv")
+        self.assertGreater(rows[1]["length"], 0)
 
 
 if __name__ == "__main__":

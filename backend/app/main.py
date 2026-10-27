@@ -12,11 +12,15 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from .api import register
+from .api import errors
+from .api import register as register_auth
+from .api.answers import register as register_answers
 from .auth import SESSION_TTL_SECONDS, AdminAuth
+from .store import Store
 
 DEFAULT_SESSION_HOURS = SESSION_TTL_SECONDS // 3600
 
@@ -57,7 +61,30 @@ def create_app(*, auth: AdminAuth | None = None) -> FastAPI:
             )
         auth = AdminAuth(password, ttl_seconds=session_hours_from_env() * 3600)
 
-    app = FastAPI(title="DeepJudge", version="0.1.0")
+    store = _store_from_env()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        if app.state.store is not None:
+            app.state.store.dispose()
+
+    app = FastAPI(title="DeepJudge", version="0.1.0", lifespan=lifespan)
     app.state.auth = auth
-    register(app, auth, secure_cookie=_env_flag("COOKIE_SECURE"))
+    app.state.store = store
+
+    errors.register(app)
+    register_auth(app, auth, secure_cookie=_env_flag("COOKIE_SECURE"))
+    register_answers(app)
     return app
+
+
+def _store_from_env() -> Store | None:
+    """没有 DATABASE_URL 就让业务接口返回 503，而不是让整个服务起不来。
+
+    认证与前端骨架不该被"这台机器没装 MySQL"卡住（本机就没有）。
+    """
+    url = (os.environ.get("DATABASE_URL") or "").strip()
+    if not url:
+        return None
+    return Store.from_url(url)

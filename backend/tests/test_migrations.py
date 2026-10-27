@@ -5,7 +5,6 @@
 所以这里真的执行一遍 upgrade/downgrade，再把迁移出来的结构与 metadata 逐项对照。
 """
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,15 +22,7 @@ from alembic.config import Config
 from sqlalchemy import ForeignKeyConstraint, UniqueConstraint, create_engine, inspect
 
 from app.store.tables import metadata
-
-BACKEND_DIR = Path(__file__).resolve().parents[1]
-
-
-def alembic_config(url: str) -> Config:
-    config = Config(str(BACKEND_DIR / "alembic.ini"))
-    config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
-    os.environ["DATABASE_URL"] = url
-    return config
+from tests.support import BACKEND_DIR, database_url
 
 
 def describe_metadata() -> dict:
@@ -89,13 +80,12 @@ class MigrationMatchesMetadata(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         self.url = f"sqlite:///{Path(self.tempdir.name) / 'migrate.db'}"
-        previous = os.environ.get("DATABASE_URL")
-        self.addCleanup(
-            lambda: os.environ.pop("DATABASE_URL", None)
-            if previous is None
-            else os.environ.__setitem__("DATABASE_URL", previous)
-        )
-        self.config = alembic_config(self.url)
+        self.config = Config(str(BACKEND_DIR / "alembic.ini"))
+        self.config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+        # 让 env.py 读到的 URL 与这里一致；context 退出时自动恢复
+        env = database_url(self.url)
+        env.__enter__()
+        self.addCleanup(lambda: env.__exit__(None, None, None))
 
     def test_upgrade_creates_every_table_and_column(self):
         command.upgrade(self.config, "head")

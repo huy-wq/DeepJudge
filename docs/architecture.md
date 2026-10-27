@@ -90,10 +90,13 @@ backend/
 │   ├── main.py               # FastAPI 装配：工厂函数 + 启动期口令校验
 │   ├── config.py             # .env 读取（无第三方依赖）
 │   ├── api/
-│   │   ├── routes.py         # 登录 / 退出 / 会话 + 后续的提交、查询、复核接口
-│   │   ├── deps.py           # 认证依赖：没有有效会话就 401
+│   │   ├── routes.py         # 登录 / 退出 / 会话 / 健康检查
+│   │   ├── answers.py        # 答卷导入：预览与入库
+│   │   ├── deps.py           # 认证依赖（401）与数据库依赖（503）
+│   │   ├── errors.py         # 领域异常 → 状态码；422 不回显请求内容
 │   │   └── schemas.py        # 请求响应模型（pydantic）
 │   ├── auth.py               # 共享口令校验 + 服务端会话登记（可撤销、可过期）
+│   ├── importing.py          # 答卷导入解析（纯函数，不碰库与 HTTP）
 │   ├── core/
 │   │   ├── rubric.py         # 4.1 的校验与加载；问题分「阻断 / 仅提示」两类
 │   │   ├── json_extract.py   # 模型输出 → JSON 对象（剥围栏、报错码）
@@ -112,7 +115,8 @@ backend/
 │   └── store/                # 存储层（MySQL 8）
 │       ├── tables.py         # 8 张表的定义；方言差异收在 with_variant 里
 │       ├── repository.py     # 写入（一个事务）与读取（还原成领域对象）
-│       └── __init__.py       # 对外只暴露 Store / RunMeta / StoredEvaluation / RunRecord（metadata 给迁移用）
+│       └── __init__.py       # 对外暴露 Store、RunMeta/RunRecord、StoredEvaluation、
+│                             #   ImportOutcome、QuestionNotFound（metadata 给迁移用）
 ├── migrations/               # Alembic 迁移脚本（表结构的部署真源）
 ├── alembic.ini
 ├── tests/                    # 纯函数单测 + 合成用例回归
@@ -125,6 +129,7 @@ backend/
 | --- | --- | --- |
 | 入口 | `main.py`、`api/` | 以下全部 |
 | 适配 | `auth.py` | 仅标准库（不读环境变量：口令由入口传进来） |
+| 编排 | `importing.py` | 仅标准库（不碰库、不碰 HTTP） |
 | 编排 | `pipeline.py` | core、providers |
 | 编排 | `rubric_gen.py` | core、providers |
 | 编排 | `store/repository.py` | core、providers，以及 `pipeline.Evaluation`（"一次评分的产出"这个类型由 pipeline 定义） |
@@ -207,7 +212,7 @@ backend/
 ```text
 questions(id, code, stem, type, total_score, status, created_at)
 rubrics(id, question_id, version, schema_json, checksum, created_at)
-answers(id, question_id, student_pseudo_id, raw_text, normalized_text, truncated, created_at)
+answers(id, question_id, student_pseudo_id, raw_text, normalized_text, content_hash, source, truncated, created_at)
 grading_runs(id, answer_id, rubric_id, prompt_version, model, params_json, status,
              score, comment, tokens_in, tokens_out, latency_ms, error, created_at)
 item_results(id, run_id, kind, rubric_item_id, level, hit, evidence,
@@ -231,6 +236,9 @@ calibration_models(id, version, method, params_json, train_size, metrics_json, c
 | 分值统一 `DOUBLE` 且 `asdecimal=False` | 否则 MySQL 回来是 `Decimal`、SQLite 回来是 `float`，同一份结果两副面孔 |
 | 所有表 `utf8mb4` + `InnoDB` | 唯一能完整存下 emoji 的字符集；中文不需要特殊照顾，不需要照顾的才不容易坏 |
 | `span_start`/`span_end` 是**原文**偏移 | 高亮要落在学生原话上，规范化后的文本只作审计与检索 |
+| `answers.content_hash` = sha256(规范化文本) | 查重要按内容比对，不能对 LONGTEXT 做等值查询；规范化后全角/半角、多空格都算同一份 |
+| `answers.source` ∈ `csv` / `paste` | 答卷是批量导入还是单份补录，出问题时能区分 |
+| `content_hash` 的空串是历史遗留 | 加这一列之前写入的行拿不到指纹（迁移不会去重算）。**代价：这些行查不出重复**，需要时跑一次回填脚本（尚未提供） |
 | `calibrated_score` 与 `calibration_version` 校准上线前恒为 `NULL` | 字段先留，语义不含糊：`NULL` 就是"没校准"，不是"校准为 0" |
 
 `student_pseudo_id` 是脱敏占位符，不存姓名学号。审计日志与申诉表留到有真实用户时再加。
@@ -340,6 +348,22 @@ system 中的三条硬纪律：
 - **不支持图片答卷**（拍照/扫描）。本期只处理文本；`source` 字段预留，未来接 OCR 时填。
 - 学生不登录、不接触系统，因此不需要学生账号表、token 或 session UUID。
 - 学号只作为导入文件里的占位标识，落库前脱敏为 `student_pseudo_id`（如 `S-0001`），**不存真实学号与姓名**。
+
+**导入规则（`app/importing.py`，纯函数）**
+
+| 项 | 规则 |
+| --- | --- |
+| 两种来源 | `csv`：一行一份；`paste`：整段文本算一份答案，题号由调用方给出 |
+| 列数 | 无题号参数时 2 列（题号,答案）或 3 列（学号,题号,答案）；给了题号时 1 列（答案）或 2 列（学号,答案） |
+| 表头 | 可选。**所有**非空单元格都是表头词才认定为表头（否则数据行会被误当表头） |
+| 列数一致性 | 以第一行定基准宽度；后续行列数不同 → 该行进坏行清单，不影响其他行 |
+| 坏行 | 只记录**行号 + 原因**，**绝不回显原文**——坏行里哪一列是学号无从判断，回显等于把学号送到前端与日志 |
+| 查重 | 同题号 + `content_hash` 相同即视为重复；批内重复与库内重复都算 |
+| 脱敏编号 | 按题号各自连续编号 `S-0001`、`S-0002`…，与真实学号无关；学号列读到即丢 |
+| 预览与入库 | 两条路由用**同一段原文重新解析**，不接收客户端回传的行——否则预览与入库会悄悄对不上 |
+| 取消 | 只调预览、不调入库，因此不产生任何数据；入库本身是单事务 |
+
+> 预览里 `rows_with_student_id` 的含义是"成功解析且带学号的行数"，坏行不计入。
 
 这一决定砍掉了整个学生端：少一个角色、少一套权限、少一类页面。演示时只需一个窗口。
 

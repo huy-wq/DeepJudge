@@ -111,6 +111,26 @@ curl -s -c /tmp/c.txt -X POST http://127.0.0.1:8000/api/auth/login \
 curl -s -b /tmp/c.txt http://127.0.0.1:8000/api/auth/session                            # 200
 ```
 
+**导入一个班的答卷（先预览、再入库）**
+
+```bash
+# 预览：返回行数、题号、坏行（只报行号与原因）与重复项，不写库
+curl -s -b /tmp/c.txt -X POST http://127.0.0.1:8000/api/answers/preview \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'JSON'
+{"source":"csv","text":"学号,题号,答案\n2024001,Q-01,客户端发送 SYN\n"}
+JSON
+
+# 确认入库：学号在解析阶段就丢弃，只生成 S-0001 这类脱敏编号
+curl -s -b /tmp/c.txt -X POST http://127.0.0.1:8000/api/answers/import \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'JSON'
+{"source":"csv","text":"学号,题号,答案\n2024001,Q-01,客户端发送 SYN\n"}
+JSON
+```
+
+入库要求题号已存在（保存评分标准时会创建题目）。样例文件见 `data/samples/tcp-handshake/answers.csv`。
+
 **先把教师的一段口述变成结构化标准**
 
 ```bash

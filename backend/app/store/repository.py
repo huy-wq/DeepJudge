@@ -13,14 +13,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, select
+from sqlalchemy import Engine, create_engine, func, select
 from sqlalchemy.pool import StaticPool
 
 from ..core.aggregate import Aggregate
-from ..core.normalize import normalize_with_map
+from ..core.normalize import hash_normalized, normalize_with_map
 from ..core.routing import RouteDecision
 from ..core.rubric import from_dict, to_dict
 from ..core.types import DeductionJudgement, ItemJudgement, Rubric, SampleJudgement
@@ -75,6 +76,24 @@ class RunRecord:
     tokens_in: int | None
     tokens_out: int | None
     latency_ms: int | None
+
+
+class QuestionNotFound(LookupError):
+    """要导入的题号在库里不存在——通常是因为还没保存过这份评分标准。"""
+
+
+@dataclass(frozen=True)
+class ImportedAnswer:
+    answer_id: int
+    question_code: str
+    pseudo_id: str
+    content_hash: str
+
+
+@dataclass(frozen=True)
+class ImportOutcome:
+    imported: list[ImportedAnswer]
+    skipped_duplicates: int
 
 
 @dataclass(frozen=True)
@@ -180,6 +199,8 @@ class Store:
                     student_pseudo_id=student_pseudo_id,
                     raw_text=answer_text,
                     normalized_text=normalized_text,
+                    content_hash=hash_normalized(normalized_text),
+                    source="paste",
                     truncated=truncated,
                 )
             ).inserted_primary_key[0]
@@ -325,6 +346,190 @@ class Store:
         ]
         if rows:
             conn.execute(item_results.insert(), rows)
+
+    # ------------------------------------------------------------------ 答卷导入
+
+    def get_question(self, code: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            return self._question_row(conn, code)
+
+    def find_duplicates(self, pairs: list[tuple[str, str]]) -> set[tuple[str, str]]:
+        """给定一批 (题号, 内容指纹)，返回库里已存在的那些。
+
+        **按 (题号, 指纹) 成对判断**：两道题出现同样的文字不算重复——
+        把各题的指纹并成一个集合再判断，会让 Q-01 的答案是"三次握手"时，
+        Q-02 里同样的"三次握手"被误标成重复。
+        """
+        if not pairs:
+            return set()
+        by_code: dict[str, set[str]] = {}
+        for code, digest in pairs:
+            by_code.setdefault(code, set()).add(digest)
+
+        found: set[tuple[str, str]] = set()
+        with self._engine.connect() as conn:
+            for code, digests in by_code.items():
+                question = self._question_row(conn, code)
+                if question is None:
+                    continue
+                rows = conn.execute(
+                    select(answers.c.content_hash).where(
+                        answers.c.question_id == question["id"],
+                        answers.c.content_hash.in_(sorted(digests)),
+                    )
+                ).scalars().all()
+                found.update((code, digest) for digest in rows)
+        return found
+
+    def import_answers(
+        self,
+        rows: list[tuple[str, str]],
+        *,
+        source: str,
+        skip_duplicates: bool = True,
+    ) -> ImportOutcome:
+        """把 (题号, 答案) 批量入库。**一个事务**：要么全进，要么全不进。
+
+        学号在解析阶段就丢了，这里只生成与学号无关的脱敏编号（`S-0001`…）。
+        """
+        if not rows:
+            return ImportOutcome(imported=[], skipped_duplicates=0)
+
+        imported: list[ImportedAnswer] = []
+        skipped = 0
+        with self._engine.begin() as conn:
+            questions_by_code: dict[str, dict] = {}
+            unknown: list[str] = []
+            for code, _ in rows:
+                if code in questions_by_code:
+                    continue
+                question = self._question_row(conn, code)
+                if question is None:
+                    unknown.append(code)
+                else:
+                    questions_by_code[code] = question
+            if unknown:
+                raise QuestionNotFound(
+                    "题号不存在：" + "、".join(sorted(set(unknown))) + "（先保存这份评分标准，再导入答卷）"
+                )
+
+            next_seq = {
+                code: self._next_pseudo_seq(conn, question["id"])
+                for code, question in questions_by_code.items()
+            }
+            seen: set[tuple[int, str]] = set()
+
+            for code, text in rows:
+                question = questions_by_code[code]
+                normalized = normalize_with_map(text)[0]
+                digest = hash_normalized(normalized)
+                if skip_duplicates:
+                    if (question["id"], digest) in seen or self._hash_exists(
+                        conn, question["id"], digest
+                    ):
+                        skipped += 1
+                        continue
+                seen.add((question["id"], digest))
+
+                pseudo_id = f"S-{next_seq[code]:04d}"
+                next_seq[code] += 1
+                answer_id = conn.execute(
+                    answers.insert().values(
+                        question_id=question["id"],
+                        student_pseudo_id=pseudo_id,
+                        raw_text=text,
+                        normalized_text=normalized,
+                        content_hash=digest,
+                        source=source,
+                    )
+                ).inserted_primary_key[0]
+                imported.append(
+                    ImportedAnswer(
+                        answer_id=answer_id,
+                        question_code=code,
+                        pseudo_id=pseudo_id,
+                        content_hash=digest,
+                    )
+                )
+
+        return ImportOutcome(imported=imported, skipped_duplicates=skipped)
+
+    def list_answers(self, question_code: str, *, limit: int = 500) -> list[dict[str, Any]]:
+        """列出某题的答卷（不含原文，列表用不着整段文本）。"""
+        with self._engine.connect() as conn:
+            question = self._question_row(conn, question_code)
+            if question is None:
+                return []
+            rows = conn.execute(
+                select(
+                    answers.c.id,
+                    answers.c.student_pseudo_id,
+                    answers.c.source,
+                    answers.c.created_at,
+                    func.length(answers.c.raw_text),
+                )
+                .where(answers.c.question_id == question["id"])
+                .order_by(answers.c.id)
+                .limit(limit)
+            ).all()
+        return [
+            {
+                "answer_id": row[0],
+                "pseudo_id": row[1],
+                "source": row[2],
+                "created_at": row[3],
+                "length": row[4],
+            }
+            for row in rows
+        ]
+
+    def count_answers(self, question_code: str) -> int:
+        with self._engine.connect() as conn:
+            question = self._question_row(conn, question_code)
+            if question is None:
+                return 0
+            return conn.execute(
+                select(func.count()).select_from(answers).where(
+                    answers.c.question_id == question["id"]
+                )
+            ).scalar_one()
+
+    def _question_row(self, conn, code: str) -> dict[str, Any] | None:
+        row = conn.execute(
+            select(questions.c.id, questions.c.code, questions.c.stem, questions.c.total_score)
+            .where(questions.c.code == code)
+        ).first()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "code": row[1],
+            "stem": row[2],
+            "total_score": row[3],
+        }
+
+    def _hash_exists(self, conn, question_id: int, digest: str) -> bool:
+        return (
+            conn.execute(
+                select(answers.c.id).where(
+                    answers.c.question_id == question_id,
+                    answers.c.content_hash == digest,
+                )
+            ).first()
+            is not None
+        )
+
+    def _next_pseudo_seq(self, conn, question_id: int) -> int:
+        """下一个脱敏编号的序号：取该题已有编号的最大值 +1，与学号无关。"""
+        used = conn.execute(
+            select(answers.c.student_pseudo_id).where(answers.c.question_id == question_id)
+        ).scalars().all()
+        numbers = [
+            int(match.group(1))
+            for pid in used
+            if (match := re.fullmatch(r"S-(\d+)", pid or ""))
+        ]
+        return max(numbers) + 1 if numbers else 1
 
     # ------------------------------------------------------------------ 读取
 

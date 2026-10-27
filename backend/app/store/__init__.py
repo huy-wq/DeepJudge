@@ -5,7 +5,26 @@
 唯一例外是 `metadata`：Alembic 需要它来对照模型，所以显式导出。
 """
 
-from .repository import DEFAULT_PSEUDO_ID, RunMeta, Store, StoredEvaluation
+from .repository import (
+    DEFAULT_PSEUDO_ID,
+    ImportOutcome,
+    ImportedAnswer,
+    QuestionNotFound,
+    RunMeta,
+    RunRecord,
+    Store,
+    StoredEvaluation,
+)
 from .tables import metadata
 
-__all__ = ["DEFAULT_PSEUDO_ID", "RunMeta", "Store", "StoredEvaluation", "metadata"]
+__all__ = [
+    "DEFAULT_PSEUDO_ID",
+    "ImportOutcome",
+    "ImportedAnswer",
+    "QuestionNotFound",
+    "RunMeta",
+    "RunRecord",
+    "Store",
+    "StoredEvaluation",
+    "metadata",
+]

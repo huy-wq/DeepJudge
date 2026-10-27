@@ -6,9 +6,9 @@
 >
 > 若两者冲突，以 `docs/architecture.md` 为准；发现冲突请改本文件。
 
-**当前状态**：141 个测试通过（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
-裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归），约 8000 行（含文档与测试）。
-已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#10 标准生成。
+**当前状态**：193 个测试通过（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
+裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归），约 9500 行（含文档与测试）。
+已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#10 标准生成。
 **没有**的部分见 §8，别在代码里找不存在的东西。
 
 ---
@@ -38,13 +38,14 @@ backend/
 │   ├── pipeline.py      ← 编排：把上面两层串成"一次评分"
 │   ├── rubric_gen.py    ← 编排：把教师口述的标准变成结构化标准（三视图 + 一次重试）
 │   ├── store/           ← 持久化（唯一碰 SQL 的地方）
-│   ├── api/             ← HTTP 接口层：路由、认证依赖、请求响应模型
+│   ├── api/             ← HTTP 接口层：路由、认证/数据库依赖、错误映射
+│   ├── importing.py      ← 答卷导入解析（纯函数，不碰库与 HTTP）
 │   ├── auth.py          ← 共享口令 + 服务端会话（可撤销、可过期）
 │   ├── main.py          ← FastAPI 装配（工厂函数，启动期校验口令）
 │   ├── cli.py           ← 命令行入口与报告组装
 │   └── config.py        ← .env 读取
 ├── migrations/          ← Alembic 迁移（表结构的部署真源）
-├── tests/               ← 141 个用例
+├── tests/               ← 193 个用例
 └── scripts/             ← 实验脚本（backend/scripts，如方差实测）
 
 仓库根目录还有：docker-compose.yml（本地 MySQL 8）、scripts/dev-db.sh（一键起库 + 迁移）。
@@ -62,7 +63,8 @@ backend/
 | `core/aggregate.py` + `core/routing.py` | 194 | 仅标准库 | ⑦ |
 | `store/` | 719 | SQLAlchemy | ⑧ |
 | `cli.py` | 206 | 全部 | ⑨ |
-| `auth.py` + `api/` + `main.py` | 约 330 | FastAPI | ⑩（另一条主线：HTTP 入口） |
+| `auth.py` + `api/` + `main.py` | 约 400 | FastAPI | ⑩（另一条主线：HTTP 入口） |
+| `importing.py` | 260 | 仅标准库 + core | ⑪（答卷怎么进来） |
 
 **依赖方向是硬约束，不是风格建议。** 可以用一条命令自己验：
 
@@ -662,6 +664,61 @@ curl -s -b /tmp/c.txt http://127.0.0.1:8000/api/auth/session
 **读完要能回答**：为什么 `GET /api/health` 不需要登录？
 （因为"受保护"指的是管理接口；健康检查是给部署探针用的，登录反而没法探。）
 
+### ⑪ 答卷怎么进来：`app/importing.py` + `app/api/answers.py`（约 20 分钟）
+
+**职责**：把教师手里的 CSV 或一段粘贴文本，变成"可入库的行 + 坏行清单"。
+
+这一层只有一个真问题：**别让学号漏出去**。所有设计都围着它转。
+
+| 位置 | 在干什么 | 读的时候注意 |
+| --- | --- | --- |
+| `app/importing.py:99` `parse_answers` | 唯一入口，永远返回 `ParsedImport`，不抛 | 坏行进 `problems`，不中断整份文件 |
+| `:61` `ParsedRow` | 一行好数据：行号 / 题号 / 答案 | 学号列**不在这里**，读到就丢了 |
+| `:68` `ProblemRow` | 一行坏数据：**只有**行号与原因 | 刻意没有原文：坏行里哪列是学号无从判断 |
+| `:80` `ParsedImport` | 解析结果 | `ok=False` 时 `error` 是一句人话，`rows` 为空 |
+| `app/core/normalize.py:40` `content_hash` | 查重指纹 | 规范化后取 sha256：全角/半角、多空格都算同一份 |
+| `app/api/answers.py:20` `preview` | 只解析 + 查重，**不写库** | 取消导入就是只调它 |
+| `:92` `import` | 拿同一段原文**重新解析**后单事务入库 | 不接收客户端回传的行 |
+| `app/api/deps.py:40` `require_store` | 没配数据库就 503 | 让认证与前端能在没 MySQL 的机器上跑 |
+
+**三处必须看出的设计**：
+
+1. **预览与入库不共享"解析结果"，只共享"解析器"。**
+   `import` 会拿同一份 `text` 再解析一遍。若改为接收前端回传的行，预览说 45 行、入库 44 行这种
+   偏差就没人能发现。
+
+2. **坏行只报行号。**
+   这是隐私取舍，不是偷懒：坏行的列角色未定，回显原文等于把学号送进响应体与日志。
+   测试 `test_broken_rows_never_echo_the_original_line` 钉住它。
+
+3. **脱敏编号与学号无关。**
+   `S-0001` 是按题号顺序生成的序号（`store/repository.py:384` `import_answers`），
+   与真实的 2024001 没有任何对应关系——否则"脱敏"只是换了个字段名。
+
+**动手验证**（真库 + 真 HTTP，SQLite 即可）：
+
+```bash
+cd backend
+rm -f /tmp/imp.db
+DATABASE_URL="sqlite:////tmp/imp.db" python3 -m alembic upgrade head
+DATABASE_URL="sqlite:////tmp/imp.db" ADMIN_PASSWORD=devpass \
+  python3 -m uvicorn app.main:create_app --factory --port 8000 &
+# 先建题目（保存一份标准）
+python3 -m app.cli --rubric ../data/samples/tcp-handshake/rubric.json \
+  --answer ../data/samples/tcp-handshake/answer.txt \
+  --response ../data/samples/tcp-handshake/response.json \
+  --save --database-url "sqlite:////tmp/imp.db"
+# 登录后预览（把 CSV 塞进 JSON 用 python3 拼，别用 sed 手拼转义）
+curl -s -c /tmp/c.txt -X POST localhost:8000/api/auth/login \
+  -H 'content-type: application/json' -d '{"password":"devpass"}'
+python3 -c 'import json;print(json.dumps({"source":"csv","text":open("../data/samples/tcp-handshake/answers.csv",encoding="utf-8").read()}))' > /tmp/body.json
+curl -s -b /tmp/c.txt -X POST localhost:8000/api/answers/preview \
+  -H 'content-type: application/json' --data-binary @/tmp/body.json
+```
+
+**读完要能回答**：为什么"取消导入不产生任何数据"这条验收几乎没有实现成本？
+（因为预览和入库是两条独立的路由，前端不点确认就不会调 import。）
+
 ---
 
 ## 3. 三条主线追踪
@@ -726,9 +783,11 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 | `test_rubric_gen.py` | 20 | 生成提示词含纪律；重试带上错误且禁止补点；模型改不了 `rules`/`must_hit`；三视图各就各位 |
 | `test_gen_rubric_script.py` | 6 | 生成脚本的退出码（含模型调用失败）与三视图输出；保存的标准能直接喂给评分 |
 | `test_cli.py` | 5 | 报告字段齐全；错误码；`--save` 能读回 |
-| `test_store.py` | 9 | 字段无损往返；标准快照不可变；重评后按旧运行号不会串到新结论 |
+| `test_store.py` | 17 | 字段无损往返；标准快照不可变；重评后按旧运行号不会串到新结论；导入与查重 |
 | `test_migrations.py` | 2 | 迁移建出的表 == `tables.py`（逐列、逐索引、逐外键） |
 | `test_store_mysql.py` | 3 | 真库 `utf8mb4`；中文与 emoji 在 TEXT 与 **JSON 列**都能存活（默认跳过） |
+| `test_importing.py` | 25 | 两种来源、表头（含空列不错位）、列数、坏行、BOM/CRLF、引号内换行、**坏行不回显学号** |
+| `test_api_answers.py` | 19 | 预览不写库、按题号查重（跨题不误判、批内标重复）、未登录 401、无库 503、422 不回显内容 |
 | `test_auth.py` | 13 | 口令校验、会话过期（拨表不 sleep）、退出即撤销、口令为空拒绝启动 |
 | `test_api_auth.py` | 14 | 401 的三种来源、登录下发 cookie、错口令不透露原因、退出后重放旧 cookie 必须 401 |
 
@@ -760,6 +819,12 @@ python3 -m app.cli \
   --answer ../data/samples/tcp-handshake/answer.txt \
   --response ../data/samples/tcp-handshake/response.json \
   --samples 3
+
+# 起 HTTP 服务并带一个 SQLite 库（业务接口需要 DATABASE_URL，否则 503）
+cd backend && rm -f /tmp/dj.db
+DATABASE_URL="sqlite:////tmp/dj.db" python3 -m alembic upgrade head
+DATABASE_URL="sqlite:////tmp/dj.db" ADMIN_PASSWORD=devpass \
+  python3 -m uvicorn app.main:create_app --factory --port 8000
 
 # 起 HTTP 服务（不需要数据库；没有 ADMIN_PASSWORD 会直接失败）
 cd backend && ADMIN_PASSWORD=devpass python3 -m uvicorn app.main:create_app --factory --port 8000
@@ -808,10 +873,12 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 | 调聚合或路由阈值 | `core/aggregate.py` / `core/routing.py` 的 `RoutePolicy` | `store/` |
 | 加一种采分点类型 | `core/types.py` + `core/rubric.py` 的校验 + 迁移 | `cli.py` |
 | 加字段落库 | `store/tables.py` + 新迁移 + `save/load` | 其它层 |
-| 加 HTTP 接口 | `app/api/routes.py` 里加，受保护接口挂 `Depends(require_admin)` | `core/`、`auth.py` |
+| 加 HTTP 接口 | `app/api/*.py` 里加 `register(app)`，受保护接口挂 `Depends(require_admin)`，要库的挂 `Depends(require_store)` | `core/`、`auth.py` |
+| 改导入格式（如 Excel） | `app/importing.py` 加一个 `source` 分支 | `store/`、`api/` |
 | 换会话存储（Redis / 数据库） | 只换 `AdminAuth` 的登记表实现 | `api/`、`main.py` |
 
-`Store` 的公开成员只有五个：`from_url` / `engine` / `dispose` / `save_evaluation` / `load_evaluation`。
+`Store` 的公开成员：`from_url` / `engine` / `dispose` / `save_evaluation` / `load_evaluation` /
+`get_question` / `find_duplicates` / `import_answers` / `list_answers` / `count_answers`。
 `create_schema` 已经被拿掉了——建表只能走迁移，`tests/support.py` 里那份是测试专用。
 
 ---
@@ -822,8 +889,8 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 
 | 缺什么 | 属于哪张工单 | 现状 |
 | --- | --- | --- |
-| 业务接口（导入/评分/复核） | #7 之后 | `app/api/` 已建，但只有登录/退出/会话/健康检查 |
-| 答卷批量导入 | #7 | 只能一次一份，用 `--answer` |
+| 评分/复核接口 | #8、#9 | `app/api/` 目前只有认证、健康检查、答卷导入与答卷列表 |
+| 导入批次撤销 | 未定 | 只能按 answer_id 删；验收只要求"取消导入不产生数据"，已满足 |
 | 后台批量评分任务 | #8 | 没有，`evaluate` 是同步的 |
 | 复核界面与人工改分 | #9 | 只有 `reviews` 表，没有读写它的代码 |
 | 自然语言 → 标准（HTTP 接口） | #13 | 生成逻辑已在 `app/rubric_gen.py`，但只有脚本入口，没有 REST |

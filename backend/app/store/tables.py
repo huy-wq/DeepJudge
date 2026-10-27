@@ -89,9 +89,24 @@ answers = Table(
     Column("student_pseudo_id", String(64), nullable=False, server_default="anon"),
     Column("raw_text", LongText, nullable=False),
     Column("normalized_text", LongText, nullable=False, comment="规范化后的文本，供检索与审计；证据偏移基于原文"),
+    Column(
+        "content_hash",
+        String(64),
+        nullable=False,
+        server_default="",
+        comment="规范化文本的 sha256，查重用；空串只可能出现在本列加入之前的历史行",
+    ),
+    Column(
+        "source",
+        String(16),
+        nullable=False,
+        server_default="paste",
+        comment="csv / paste：答卷是怎么进来的（架构 §5.7 预留字段）",
+    ),
     Column("truncated", Boolean, nullable=False, server_default="0"),
     Column("created_at", DateTime, nullable=False, server_default=func.now()),
     Index("ix_answers_question", "question_id"),
+    Index("ix_answers_content", "question_id", "content_hash"),
     **MYSQL_TABLE_ARGS,
 )
 
