@@ -15,7 +15,7 @@ from pathlib import Path
 from .core.aggregate import sample_score
 from .pipeline import Evaluation, GradingError, evaluate
 from .config import load_project_env
-from .core.rubric import RubricError, load_file
+from .core.rubric import RubricError, load_file, validate
 from .providers.base import ProviderError
 from .providers.deepseek import DeepSeekConfig, DeepSeekProvider
 from .providers.fake import CannedProvider
@@ -158,9 +158,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         rubric = load_file(args.rubric)
     except RubricError as exc:
-        for problem in exc.problems:
-            print(f"- {problem}", file=sys.stderr)
+        blocking = exc.blocking or exc.issues
+        print("评分标准不合法：", file=sys.stderr)
+        for issue in blocking:
+            print(f"- [{issue.code}] {issue.message}", file=sys.stderr)
         return 2
+
+    # 不拦保存、但会影响评分可靠性：照常评，只把话说到前面。
+    for issue in validate(rubric):
+        print(f"提示 [{issue.code}]：{issue.message}", file=sys.stderr)
 
     answer = Path(args.answer).read_text(encoding="utf-8")
 

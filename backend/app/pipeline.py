@@ -5,19 +5,16 @@
 
 from __future__ import annotations
 
-import json
-import re
+from dataclasses import dataclass
 from typing import Any
 
 from .core.aggregate import Aggregate, aggregate, sample_score
 from .core.grounding import apply_grounding
+from .core.json_extract import PayloadError, extract_payload
 from .core.prompt import build_messages
 from .core.routing import RouteDecision, RoutePolicy, decide
-from dataclasses import dataclass
 from .core.types import EPS, DeductionJudgement, ItemJudgement, Rubric, SampleJudgement
 from .providers.base import GradingProvider
-
-_FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.S)
 
 
 class GradingError(Exception):
@@ -30,20 +27,6 @@ class GradingError(Exception):
         self.code = code
         self.message = message
         super().__init__(f"[{code}] {message}")
-
-
-def extract_payload(text: str) -> dict[str, Any]:
-    text = (text or "").strip()
-    fenced = _FENCE.match(text)
-    if fenced:
-        text = fenced.group(1)
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise GradingError("INVALID_JSON", f"模型输出不是合法 JSON：{exc}") from exc
-    if not isinstance(payload, dict):
-        raise GradingError("NOT_OBJECT", "模型输出必须是 JSON 对象")
-    return payload
 
 
 def _index_by_id(entries: Any) -> dict[str, dict]:
@@ -110,7 +93,11 @@ def grade(
     sample_index: int = 0,
 ) -> SampleJudgement:
     raw = provider.complete(build_messages(rubric, answer), sample_index=sample_index)
-    payload = extract_payload(raw)
+    try:
+        payload = extract_payload(raw)
+    except PayloadError as exc:
+        # 换成流水线自己的错误类型：调用方只需要认 GradingError 一种
+        raise GradingError(exc.code, exc.message) from exc
 
     items = _parse_items(rubric, payload)
     deductions = _parse_deductions(rubric, payload)

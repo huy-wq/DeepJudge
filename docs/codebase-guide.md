@@ -6,8 +6,9 @@
 >
 > 若两者冲突，以 `docs/architecture.md` 为准；发现冲突请改本文件。
 
-**当前状态**：75 个测试通过（3 个 MySQL 真库用例默认跳过），约 5100 行（含文档与测试）。
-已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化。
+**当前状态**：114 个测试通过（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
+裸 `python3` 会因缺少 SQLAlchemy 跳过存储用例，数字对不上不是回归），约 7300 行（含文档与测试）。
+已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#10 标准生成。
 **没有**的部分见 §8，别在代码里找不存在的东西。
 
 ---
@@ -32,14 +33,15 @@
 backend/
 ├── app/
 │   ├── core/            ← 纯逻辑，只用标准库，可离线单测（含 types / normalize / grounding /
-│   │                        rubric / prompt / aggregate / routing）
+│   │                        rubric / json_extract / prompt / aggregate / routing）
 │   ├── providers/       ← 模型适配层（唯一碰网络的地方）
 │   ├── pipeline.py      ← 编排：把上面两层串成"一次评分"
+│   ├── rubric_gen.py    ← 编排：把教师口述的标准变成结构化标准（三视图 + 一次重试）
 │   ├── store/           ← 持久化（唯一碰 SQL 的地方）
 │   ├── cli.py           ← 命令行入口与报告组装
 │   └── config.py        ← .env 读取
 ├── migrations/          ← Alembic 迁移（表结构的部署真源）
-├── tests/               ← 75 个用例
+├── tests/               ← 114 个用例
 └── scripts/             ← 实验脚本（backend/scripts，如方差实测）
 
 仓库根目录还有：docker-compose.yml（本地 MySQL 8）、scripts/dev-db.sh（一键起库 + 迁移）。
@@ -53,6 +55,7 @@ backend/
 | `core/prompt.py` | 81 | 仅标准库 | ④ |
 | `providers/` | 174 | 标准库 `urllib`（不装 SDK） | ⑤ |
 | `pipeline.py` | 154 | core + providers | ⑥ |
+| `rubric_gen.py` | 257 | core + providers | ⑥′（与评分并列的另一条主线） |
 | `core/aggregate.py` + `core/routing.py` | 194 | 仅标准库 | ⑦ |
 | `store/` | 719 | SQLAlchemy | ⑧ |
 | `cli.py` | 206 | 全部 | ⑨ |
@@ -73,14 +76,17 @@ cd backend && grep -h "^import \|^from " app/core/*.py | grep -v "^from \." | so
 
 | # | 步骤 | 代码位置 | 确定性 |
 | --- | --- | --- | --- |
-| 1 | 载入并校验评分标准 | `core/rubric.py:57` `from_dict` → `:125` `validate` | ✅ |
+| 1 | 载入并校验评分标准 | `core/rubric.py:140` `from_dict`（内部走 `:148` `parse`）→ `:224` `validate` | ✅ |
 | 2 | 预处理答卷（规范化 + 偏移映射） | `core/normalize.py:12` `normalize_with_map` | ✅ |
 | 3 | 组装提示词 | `core/prompt.py:59` `build_messages` | ✅ |
 | 4 | **调用模型** | `providers/deepseek.py:104` `complete` | ❌ 唯一不可控的一步 |
-| 5 | 解析 + 证据接地 | `pipeline.py:35` `extract_payload`、`:58` `_parse_items`、`core/grounding.py:92` `apply_grounding` | ✅ |
+| 5 | 解析 + 证据接地 | `core/json_extract.py:31` `extract_payload`、`pipeline.py:41` `_parse_items`、`core/grounding.py:92` `apply_grounding` | ✅ |
 | 6 | 多采样聚合 | `core/aggregate.py:67` `aggregate` | ✅ |
 | 7 | 服务端算分 | `core/aggregate.py:39` `sample_score`（**唯一算分入口**） | ✅ |
 | 8 | 路由 + 落库 | `core/routing.py:34` `decide`、`store/repository.py:162` `save_evaluation` | ✅ |
+
+> 八步之外还有一条更上游的线：**先有标准，才谈得上评分**。
+> 教师的一段口述怎么变成这份 rubric，看 `app/rubric_gen.py`（见 §2 ⑥′）。
 
 **读这张表要抓住的一件事**：八步里只有第 4 步不可控，而它被 `GradingProvider` 一个方法包住。
 其余七步全是纯函数或纯数据库操作。这就是为什么测试能覆盖 95% 而不联网：
@@ -307,18 +313,19 @@ print('编造：', locate_evidence(ans, '四次挥手关闭连接'))
 
 | 位置 | 在干什么 |
 | --- | --- |
-| `:16` `RubricError` | 带 `problems: list[str]`，不是单条消息 |
-| `:57` `from_dict` | **收集式**解析：缺字段、类型错、语义错一起攒，最后统一抛 |
-| `:63` `required` | 局部闭包，省掉每行 `try/except` |
-| `:115-117` | 结构问题存在时，把"权重合计对不上"这条噪音过滤掉 |
-| `:125` `validate` | 语义规则：权重和、id 唯一、等级单调、分值域、扣分封顶 |
-| `:188` `to_dict` | **与 `from_dict` 严格互逆**，供入库快照与前端展示 |
+| `:59` `RubricError` | 带 `issues`（结构化，含 `blocking`）；`problems` 是派生出的句子列表 |
+| `:148` `parse` | **收集式**解析：缺字段、类型错、语义错一起攒，返回 `ParsedRubric`，不抛 |
+| `:140` `from_dict` | `parse` 的包装：有阻断项才抛 |
+| `:158` `required` | 局部闭包，省掉每行 `try/except` |
+| `:218-220` | **不再**过滤"权重合计"：差额是最该看到的数字，结构错乱时更需要它 |
+| `:224` `validate` | 语义规则：权重和、id 唯一、等级单调、分值域、扣分封顶；每条带 `code` 与 `blocking` |
+| `:344` `to_dict` | **与 `from_dict` 严格互逆**，供入库快照与前端展示 |
 
 **这是本项目"报错也要设计"的样板**：用户填错标准时，最烦的是一改一报错。
 所以解析器绝不早退，而是把能查的全查完。
 
 **`to_dict` 为什么必须严格互逆**："标准快照"这四个字的全部意义在于
-存进去的和读出来的是同一份标准。`tests/test_rubric.py:84` 有个用例专门守这条。
+存进去的和读出来的是同一份标准。`tests/test_rubric.py` 里 `SerializeRubric` 专门守这条。
 
 **动手验证**：
 
@@ -390,15 +397,15 @@ print(msgs[-1]['content'][-120:])
 
 **职责**：把 1→5 步串起来，产出 `SampleJudgement`；再重复 n 次，产出 `Evaluation`。
 
-读的顺序：`extract_payload`（`:35`）→ `_parse_items`（`:58`）→ `grade`（`:105`）→ `evaluate`（`:137`）。
+读的顺序：`core/json_extract.py:31` `extract_payload` → `_parse_items`（`:41`）→ `grade`（`:88`）→ `evaluate`（`:124`）。
 
 | 位置 | 在干什么 | 读的时候注意 |
 | --- | --- | --- |
-| `:20` `_FENCE` | 剥掉 ```` ```json ```` 代码围栏 | 模型经常不听话地包一层 |
-| `:23` `GradingError` | 带错误码：`INVALID_JSON` / `NOT_OBJECT` / `MISSING_ITEM` / `INVALID_LEVEL` | 这四种都是"输出不可用"，不是"得了 0 分" |
-| `:58` `_parse_items` | 逐个采分点找模型给的条目 | 漏了任何一个就抛 `MISSING_ITEM`，不静默补 0 |
-| `:105` `grade` | 调 provider → 解析 → 接地 → **用 `sample_score` 算分** | 注意它完全不读模型给的分数 |
-| `:131` `Evaluation` | `samples + aggregate + route` 三件套 | 后面 store 的返回类型就是它 |
+| `core/json_extract.py:31` `extract_payload` | 剥掉 ```` ```json ```` 代码围栏并解析 | 模型经常不听话地包一层 |
+| `:20` `GradingError` | 带错误码：`INVALID_JSON` / `NOT_OBJECT` / `MISSING_ITEM` / `INVALID_LEVEL` | 这四种都是"输出不可用"，不是"得了 0 分" |
+| `:41` `_parse_items` | 逐个采分点找模型给的条目 | 漏了任何一个就抛 `MISSING_ITEM`，不静默补 0 |
+| `:88` `grade` | 调 provider → 解析 → 接地 → **用 `sample_score` 算分** | 注意它完全不读模型给的分数 |
+| `:118` `Evaluation` | `samples + aggregate + route` 三件套 | 后面 store 的返回类型就是它 |
 
 **这一节先把 `aggregate` 当黑盒**：`evaluate` 只是"跑 n 次 `grade`，再把 n 份结果交给
 `aggregate`，最后问 `decide` 该不该转人工"。黑盒里发生了什么，下一节 ⑦ 再拆。
@@ -423,6 +430,54 @@ print('模型说 99，服务端算出：', r.score)
 "
 # 期望 8.0
 ```
+
+### ⑥′ 另一条主线：`app/rubric_gen.py`（约 25 分钟）
+
+**职责**：教师给"题干 + 满分 + 一段口述的标准"，这里调一次模型，产出**可评分的结构化标准**。
+
+它不在评分的八步里，是比评分更上游的一条线：标准先有，才谈得上评分。
+
+| 位置 | 在干什么 | 读的时候注意 |
+| --- | --- | --- |
+| `:29` `MAX_ATTEMPTS` | 重试上限 2（原调用 + 1 次） | 与"自动重试一次"的验收一致，不要调大 |
+| `:31` `GEN_SYSTEM` | 六条纪律 | 第 1 条是核心：**不得新增教师未提及的采分点** |
+| `:61` `GeneratedRubric`（`views()` 在 `:74`） | 成功结果：标准 + 摘要 + 提示项 + 尝试次数 + 原始输出 | `views()` 一次给全三视图；`issues` 里只剩仅提示项（阻断项会让它抛错） |
+| `:92` `RubricGenerationError` | 重试后仍失败 | 带 `issues`（给教师看）与 `responses`（给排查用） |
+| `:118` `build_generation_messages` | 组装提示词 | 教师原话放最后、用 `<standard>` 包住 |
+| `:142` `preview_rows` | 预览表 | 纯数据整形，给前端渲染表格 |
+| `:163` `generate_rubric` | 主循环：调模型 → 校验 → 不合法就带上错误重试 | 见下面第 3 条 |
+| `:229` `_with_server_owned_fields` | **服务端改写题目信息** | 模型给的 `total_score`/`stem`/`question_id` 一律丢弃 |
+
+**三处必须看出来的设计**：
+
+1. **三视图各由谁产出，是不对称的。**
+   - 摘要：模型写（`_summary_of`），缺失时服务端用采分点拼一句话兜底（`_compose_summary`）。
+   - 预览表：服务端从结构化结果生成（`preview_rows`），模型碰不到。
+   - 校验清单：服务端算（`core/rubric.validate`）。
+
+   只有"对不对"需要自然语言；"全不全"和"合不合法"必须是确定性的。
+
+2. **校验清单必须能分类，不能只给中文句子。**
+   `core/rubric.py:25` 的 `RubricIssue(code, message, blocking)`：`code` 给程序分支，
+   `message` 给教师看，`blocking` 决定拦不拦保存。`RubricError.problems` 保留为派生属性，
+   所以旧调用方（`cli.py`）一行都不用改。
+
+3. **重试不是"再来一次"，是"带着错误再来一次"。**
+   `generate_rubric` 把上一轮模型原话作为 `assistant` 消息、把问题清单作为新的 `user` 消息追加上去，
+   并在里面**明确禁止补点**。没有这一步，模型会原地重复同一个错误。
+
+**动手验证**（离线，不花钱）：
+
+```bash
+cd backend
+python3 scripts/gen_rubric.py \
+  --stem "简述 TCP 三次握手的过程，并说明其目的。" --total 10 \
+  --standard "三个要点：客户端发 SYN 给 3 分；服务器回 SYN+ACK 给 4 分；客户端回 ACK 给 3 分。" \
+  --response ../data/samples/tcp-handshake/generation.json
+```
+
+三视图会依次打印出来。再试一次"模型少给一个采分点"——它应当重试一次，然后报
+`还有 3 分未分配`，且**不会**替你补出第三个点（把 `generation.json` 里的 P3 删掉再跑即可）。
 
 ### ⑦ 聚合与路由：`core/aggregate.py` + `core/routing.py`（约 40 分钟）
 
@@ -574,11 +629,11 @@ s.dispose()
 
 ```text
 rubric.json
-  → core/rubric.py:57  from_dict          校验并建 Rubric
+  → core/rubric.py:140 from_dict          校验并建 Rubric（内部 parse）
   → core/prompt.py:59  build_messages     rubric + 答案 → 消息
   → providers/deepseek.py:104  complete   调模型，拿回 JSON 字符串
-  → pipeline.py:35     extract_payload    剥围栏、json.loads
-  → pipeline.py:58     _parse_items       逐点校验 level 合法性
+  → core/json_extract.py:31 extract_payload  剥围栏、json.loads
+  → pipeline.py:41     _parse_items       逐点校验 level 合法性
   → core/grounding.py:92 apply_grounding  证据回原文定位，定位失败判 0
   → core/aggregate.py:39 sample_score     等级 → 分值，扣分项封顶，clamp
   → 得到 SampleJudgement（一次采样）
@@ -587,7 +642,7 @@ rubric.json
 ### 主线 B：为什么"三次采样"能变成"一个结论"
 
 ```text
-pipeline.py:137 evaluate
+pipeline.py:124 evaluate
   → 重复 grade() n 次，每次 sample_index 递增
   → core/aggregate.py:67  aggregate
         逐点中位数 → 重算总分 → 加权离散度 → 置信度 = (1-离散度) × 接地率
@@ -620,11 +675,13 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 
 | 测试文件 | 用例数 | 守的性质 |
 | --- | --- | --- |
-| `test_rubric.py` | 11 | 坏标准要报出**全部**问题；`to_dict`/`from_dict` 严格互逆 |
+| `test_rubric.py` | 22 | 坏标准要报出**全部**问题；阻断项与仅提示项分类正确；结构错误时仍报差额；`to_dict`/`from_dict` 严格互逆 |
 | `test_grounding.py` | 15 | 原文偏移准确；容错匹配不跨整卷拼凑；编造证据判 0；接地率不因"什么都没提取到"而虚高 |
 | `test_pipeline.py` | 10 | 模型给的分数一律不采信；缺采分点/非法等级要显式失败 |
 | `test_aggregate.py` | 10 | 偶数采样取下中位；扣分项分歧计入离散度；置信度含接地率因子 |
-| `test_deepseek_provider.py` | 10 | 请求形状、状态码映射、空响应重试、配置读取（**不联网**） |
+| `test_deepseek_provider.py` | 12 | 请求形状、状态码映射、空响应重试、配置读取（含生成/评分模型分开配）（**不联网**） |
+| `test_rubric_gen.py` | 20 | 生成提示词含纪律；重试带上错误且禁止补点；模型改不了 `rules`/`must_hit`；三视图各就各位 |
+| `test_gen_rubric_script.py` | 6 | 生成脚本的退出码（含模型调用失败）与三视图输出；保存的标准能直接喂给评分 |
 | `test_cli.py` | 5 | 报告字段齐全；错误码；`--save` 能读回 |
 | `test_store.py` | 9 | 字段无损往返；标准快照不可变；重评后按旧运行号不会串到新结论 |
 | `test_migrations.py` | 2 | 迁移建出的表 == `tables.py`（逐列、逐索引、逐外键） |
@@ -658,6 +715,11 @@ python3 -m app.cli \
   --answer ../data/samples/tcp-handshake/answer.txt \
   --response ../data/samples/tcp-handshake/response.json \
   --samples 3
+
+# 从教师原话生成结构化标准（离线；加 --live 则真调模型）
+cd backend
+python3 scripts/gen_rubric.py --stem "题干" --total 10 --standard "教师原话" \
+  --response ../data/samples/tcp-handshake/generation.json --save-rubric /tmp/rubric.json
 
 # 真调模型（需要 .env 里的 DEEPSEEK_API_KEY）
 python3 -m app.cli --rubric ... --answer ... --live --samples 3
@@ -716,7 +778,7 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 | 答卷批量导入 | #7 | 只能一次一份，用 `--answer` |
 | 后台批量评分任务 | #8 | 没有，`evaluate` 是同步的 |
 | 复核界面与人工改分 | #9 | 只有 `reviews` 表，没有读写它的代码 |
-| 自然语言 → 评分标准 | #10 | `core/rubric_gen.py` **不存在**，标准得手写 JSON |
+| 自然语言 → 标准（HTTP 接口） | #13 | 生成逻辑已在 `app/rubric_gen.py`，但只有脚本入口，没有 REST |
 | 分数校准 | 校准层 | `core/calibrate.py` **不存在**；`calibrated_score` 恒为 `NULL` |
 | 模型能力注册表 | 后续 | `providers/registry.py` **不存在** |
 | 前端 | #11–#14 | `frontend/` 目录不存在 |
@@ -747,6 +809,7 @@ Day 1（评分内核）
   ① core/types.py            → ② core/normalize.py + grounding.py（重点，边读边跑）
   → ③ core/rubric.py          → ④ core/prompt.py
   → ⑤ providers/              → ⑥ pipeline.py
+  → ⑥′ app/rubric_gen.py（另一条主线，可与 ⑥ 并行读）
   → ⑦ core/aggregate.py + routing.py
   每节读完立刻跑该节的"动手验证"，再跑一次对应测试文件。
 
@@ -778,7 +841,7 @@ Day 2（系统与工程）
 
 ---
 
-## 11. 读代码时容易撞上的五处"名不副实"
+## 11. 读代码时容易撞上的六处"名不副实"
 
 这三处不是 bug，但**只看代码或只看文档都会误解**。写论文、答辩、改代码之前先读一遍。
 
@@ -812,7 +875,17 @@ Day 2（系统与工程）
 - **状态**：已在 `docs/ticket-notes.md` 记为待拍板。加硬校验让规则名副其实，
   但会约束评分标准的写法。
 
-### 11.5 `rubric.rules`（规则开关）是死开关
+### 11.5 `from_dict` 只因为"阻断项"报错，要全部问题得用 `parse`
+
+- **现象**：`core/rubric.py` 里有两个入口——`parse()` 返回 `ParsedRubric(rubric, issues)`（不抛）、
+  `from_dict()` 是它的一层包装（有阻断项才抛 `RubricError`）。
+  仅提示项（满分不可达、判定依据为空或含糊、描述重复）不拦保存，因此 `from_dict` 不会提它们。
+- **影响**：一份"能算分但不可靠"的标准可以正常载入。这不是校验变松了，而是把
+  "能不能存"和"值不值得存"分开了（架构 §5.3）。
+- **怎么看到提示**：走 `parse()` 拿 `issues`；`app.cli` 会把仅提示项打到 stderr；
+  生成流程用 `GeneratedRubric.views()["checklist"]` 拿到完整清单。
+
+### 11.6 `rubric.rules`（规则开关）是死开关
 
 - **现象**：`allow_inference` / `synonym_ok` / `ignore_length` 三个开关会被解析、
   会存进标准快照，但**没有任何代码读它们**。`core/prompt.py` 的六条纪律硬编码在 `SYSTEM` 字符串里。

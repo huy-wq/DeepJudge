@@ -93,6 +93,20 @@ cp .env.example .env          # 填 DEEPSEEK_API_KEY；DATABASE_URL 指向本地
 
 拉不动官方镜像时换镜像站：`MYSQL_IMAGE=docker.1ms.run/library/mysql:8 ./scripts/dev-db.sh up`
 
+**先把教师的一段口述变成结构化标准**
+
+```bash
+cd backend
+# 离线：用预置的模型输出，不花钱、不联网
+python3 scripts/gen_rubric.py --stem "简述 TCP 三次握手的过程，并说明其目的。" --total 10 \
+    --standard "三个要点：客户端发 SYN 给 3 分；服务器回 SYN+ACK 给 4 分；客户端回 ACK 给 3 分。" \
+    --response ../data/samples/tcp-handshake/generation.json --save-rubric /tmp/rubric.json
+```
+
+它打印三份视图：**摘要**（这份标准在考什么）、**预览表**（有没有漏或重复）、
+**校验清单**（权重和、等级依据）。校验清单分两类：**阻断保存**的结构错误与**仅提示**的语义问题。
+模型漏了采分点时只会报"还有 N 分未分配"，不会替你补点。
+
 **跑一次评分并把结果落库**
 
 ```bash

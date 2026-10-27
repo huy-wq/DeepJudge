@@ -35,16 +35,24 @@ class DeepSeekConfig:
     thinking: bool = True
 
     @classmethod
-    def from_env(cls, environ: dict | None = None) -> "DeepSeekConfig":
+    def from_env(
+        cls, environ: dict | None = None, *, model_env: str = "DEEPSEEK_MODEL"
+    ) -> "DeepSeekConfig":
+        """从环境变量读配置。
+
+        `model_env` 允许换一个变量名读模型：标准生成用强档模型，评分用快档模型，
+        两者必须能分开配置（架构 §5.2）——生成只跑一次，评分要跑 N×M 次。
+        """
         env = os.environ if environ is None else environ
         api_key = (env.get("DEEPSEEK_API_KEY") or "").strip()
         if not api_key:
             raise ProviderError(
                 "MISSING_API_KEY", "未配置 DEEPSEEK_API_KEY", retryable=False
             )
+        model = (env.get(model_env) or env.get("DEEPSEEK_MODEL") or DEFAULT_MODEL).strip()
         return cls(
             api_key=api_key,
-            model=(env.get("DEEPSEEK_MODEL") or DEFAULT_MODEL).strip(),
+            model=model,
             base_url=(env.get("DEEPSEEK_BASE_URL") or DEFAULT_BASE_URL).strip(),
             timeout=float(env.get("DEEPSEEK_TIMEOUT") or DEFAULT_TIMEOUT),
             max_tokens=int(env.get("DEEPSEEK_MAX_TOKENS") or DEFAULT_MAX_TOKENS),

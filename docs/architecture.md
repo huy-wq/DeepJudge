@@ -93,8 +93,8 @@ backend/
 │   │   ├── routes.py         # 提交 / 查询 / 复核 三组接口
 │   │   └── schemas.py        # 请求响应模型（pydantic）
 │   ├── core/
-│   │   ├── rubric.py         # 4.1 的校验与加载
-│   │   ├── rubric_gen.py     # 5.2 的自然语言 → JSON 草稿（调强档模型）
+│   │   ├── rubric.py         # 4.1 的校验与加载；问题分「阻断 / 仅提示」两类
+│   │   ├── json_extract.py   # 模型输出 → JSON 对象（剥围栏、报错码）
 │   │   ├── normalize.py      # 规范化 + 原文偏移映射
 │   │   ├── prompt.py         # 第 3 步的模板与组装
 │   │   ├── grounding.py      # 第 5 步的证据定位
@@ -106,6 +106,7 @@ backend/
 │   │   ├── registry.py       # 模型能力表（JSON 输出 / 确定性采样 / 上下文上限）
 │   │   └── <vendor>.py       # 各供应商实现
 │   ├── pipeline.py           # 编排：调用 → 解析 → 校验 → 服务端算分
+│   ├── rubric_gen.py         # 编排：5.2 自然语言 → 结构化标准草稿（含一次重试与三视图）
 │   └── store/                # 存储层（MySQL 8）
 │       ├── tables.py         # 8 张表的定义；方言差异收在 with_variant 里
 │       ├── repository.py     # 写入（一个事务）与读取（还原成领域对象）
@@ -122,6 +123,7 @@ backend/
 | --- | --- | --- |
 | 入口 | `main.py`、`api/` | 以下全部 |
 | 编排 | `pipeline.py` | core、providers |
+| 编排 | `rubric_gen.py` | core、providers |
 | 编排 | `store/repository.py` | core、providers，以及 `pipeline.Evaluation`（"一次评分的产出"这个类型由 pipeline 定义） |
 | 领域逻辑 | `core/*` | 仅标准库 + pydantic |
 | 适配 | `providers/*`（厂商 SDK）、`store/tables.py`（SQLAlchemy 方言） | 外部依赖 |
@@ -251,12 +253,14 @@ calibration_models(id, version, method, params_json, train_size, metrics_json, c
 | 满分 | 是 | 没有满分，权重无从分配 |
 | 评分标准原文 | 是 | 教师原话，如"答对三个要点给 6 分……" |
 | 参考答案 | 否 | 强烈建议填写，能显著改善等级划分质量 |
+| 题号 | 否 | 默认 `Q-01`；多题场景在保存环节选择（#11） |
 
 题型、采分点 id、分值分配都不让教师填——由模型给草稿。
 
 ### 5.2 生成
 
 一次调用，使用**强档模型**（与评分模型分开配置：生成只跑一次，评分要跑 N×M 次）。
+落地方式是两个环境变量：评分读 `DEEPSEEK_MODEL`，生成读 `DEEPSEEK_GEN_MODEL`（留空则退回前者）。
 
 system 中的三条硬纪律：
 
@@ -276,6 +280,24 @@ system 中的三条硬纪律：
 | 校验清单 | 权重和是否等于满分、等级是否都有判定依据——**合不合法** |
 
 结构错误（权重和不等、id 重复、分值越界）**阻断保存**；语义问题（采分点疑似重叠、措辞不可判定、覆盖度不足）**只警告**，并允许教师标记"已知悉"。
+
+校验结果在代码里是 (code, message, blocking) 三元组（`core/rubric.py` 的 `RubricIssue`），
+`code` 稳定、`message` 给人看。当前实现的两类问题：
+
+| 类别 | code | 判定 |
+| --- | --- | --- |
+| 阻断 | `WEIGHT_SUM` | 权重合计与满分不等；**消息里写明差额**（"还有 3 分未分配"），不自动补点 |
+| 阻断 | `DUPLICATE_ID` / `SCORE_OUT_OF_RANGE` / `LEVEL_NOT_MONOTONIC` / `TOO_FEW_LEVELS` / `WEIGHT_NON_POSITIVE` | 标准自身不成立 |
+| 阻断 | `PENALTY_POSITIVE` / `CAP_POSITIVE` / `CAP_INEFFECTIVE` | 扣分项定义不成立 |
+| 阻断 | `MISSING_FIELD` / `BAD_TYPE` / `BAD_ITEMS` / `BAD_ITEM` / … | JSON 结构不对，连解析都不成立 |
+| 仅提示 | `TOP_LEVEL_BELOW_WEIGHT` | 最高档分值低于权重，该点满分不可达（见 §9 待定项） |
+| 仅提示 | `EMPTY_CRITERION` | 某档没有判定依据 |
+| 仅提示 | `VAGUE_CRITERION` | 判定依据含"论述充分"这类不可验证措辞（固定词表，属启发式） |
+| 仅提示 | `DUPLICATE_DESC` | 两个采分点描述完全相同，疑似重复 |
+| **未实现** | — | 「采分点疑似重叠（近似）」「覆盖度不足」需要语义比较，当前不做；只做了"描述完全相同"这个确定性子集。宁可漏报，也不要用不可靠的相似度去吓人 |
+
+**权重不足时不补点**是硬规则：模型与服务端都不许替教师编采分点，只报差额。
+这条与"模型不得新增教师未提及的采分点"是同一件事的两面。
 
 > 只给自然语言摘要等于让教师盲签：摘要永远看着合理，而结构错误它不会暴露。
 
@@ -402,6 +424,7 @@ system 中的三条硬纪律：
 | 前端 | **已定** Vue 3 | 组件库待定；复核界面是必需项 |
 | 认证 | **已定** 单口令 + cookie | 口令存 `ADMIN_PASSWORD`；公网需 HTTPS |
 | 部署 | 待定 | 本地演示优先 |
+| 最高档分值是否必须等于权重 | 待定 | 目前只作为 `TOP_LEVEL_BELOW_WEIGHT` **提示**，不拦保存。加硬校验会让"按权重算分"名副其实，但会约束评分标准的写法 |
 
 ## 附录 A 依据（精简版）
 

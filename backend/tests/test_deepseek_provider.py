@@ -151,6 +151,26 @@ class LiveModeWithoutKey(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertIn("DEEPSEEK_API_KEY", stderr.getvalue())
 
+    def test_generation_can_use_a_separate_model_variable(self):
+        env = {
+            "DEEPSEEK_API_KEY": "sk-test",
+            "DEEPSEEK_MODEL": "deepseek-flash",
+            "DEEPSEEK_GEN_MODEL": "deepseek-v4-pro",
+        }
+
+        grading = DeepSeekConfig.from_env(env)
+        generating = DeepSeekConfig.from_env(env, model_env="DEEPSEEK_GEN_MODEL")
+
+        self.assertEqual(grading.model, "deepseek-flash")
+        self.assertEqual(generating.model, "deepseek-v4-pro")
+
+    def test_generation_falls_back_to_grading_model_when_unset(self):
+        env = {"DEEPSEEK_API_KEY": "sk-test", "DEEPSEEK_MODEL": "deepseek-flash"}
+
+        config = DeepSeekConfig.from_env(env, model_env="DEEPSEEK_GEN_MODEL")
+
+        self.assertEqual(config.model, "deepseek-flash")
+
 
 if __name__ == "__main__":
     unittest.main()
