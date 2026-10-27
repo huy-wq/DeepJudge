@@ -33,6 +33,7 @@ DeepJudge/
 │   ├── architecture.md  # 唯一设计真源
 │   ├── codebase-guide.md # 代码库导读（按什么顺序读、每层看什么）
 │   ├── roadmap.md       # 功能实现清单（顺序与依赖）
+│   ├── demo.md          # 10 分钟演示脚本与降级路径（答辩用）
 │   ├── ticket-notes.md  # 工单问题记录（遇到的坑与未决问题）
 │   ├── experiments.md   # 实验记录（真实调用的设置与结果）
 │   ├── agents/          # issue tracker / 标签 / 领域文档约定
@@ -41,8 +42,9 @@ DeepJudge/
 │   ├── migrations/      # Alembic 迁移（表结构的部署真源）
 │   └── tests/           # 单测与真库验证
 ├── scripts/dev-db.sh    # 本地数据库一键起库 + 升级表结构
+├── scripts/demo.sh      # 演示数据准备（seed / reset）
 ├── docker-compose.yml   # 本地 MySQL 8（utf8mb4）
-├── frontend/            # 管理端（Vue 3 + Vite + TypeScript + Element Plus，见 #12）
+├── frontend/            # 管理端（Vue 3 + Vite + TypeScript + Element Plus）
 └── data/                # 本地答卷与标注集，默认不入库
 ```
 
@@ -55,11 +57,11 @@ DeepJudge/
 | 服务形态 | 单体后端 | **已定** |
 | 存储 | MySQL 8（`utf8mb4`）+ Alembic 迁移 | **已实现** |
 | 认证 | 共享口令 + 服务端会话 cookie | **已实现** |
-| 任务执行 | 进程内后台任务 / 独立 worker | 待定 |
-| 前端 | Vue 3 + Vite + TypeScript + Element Plus | **已实现骨架**（#12） |
+| 任务执行 | 进程内线程池（可重试、可中断恢复） | **已实现** |
+| 前端 | Vue 3 + Vite + TypeScript + Element Plus | **已实现**（登录 / 标准 / 导入与评分 / 复核） |
 | 前端测试 | Vitest + @vue/test-utils（jsdom） | **已接入** |
 | LLM 供应商与参数 | DeepSeek（`providers/deepseek.py`，标准库实现） | **已接入** |
-| 部署 | 本地优先 | 待定 |
+| 部署 | 本地优先 | 本地演示路径见 `docs/demo.md`；公网部署未做 |
 
 评分引擎只依赖 `GradingProvider` 一个接口（见架构文档第 2、3 节），换模型不影响流水线与测试。
 
@@ -300,6 +302,15 @@ python3 -m app.cli --rubric ../data/samples/tcp-handshake/rubric.json --answer .
 
 输出里的 `stored.answer_id` / `run_ids` / `aggregate_id` 就是库里的主键，可以用 `Store.load_evaluation()`
 原样读回：标准快照、答卷、每次采样、逐条证据与偏移、聚合指标、路由结论，一个字段都不少。
+
+**10 分钟演示（答辩 / 验收）**
+
+```bash
+./scripts/demo.sh reset      # 起库 + 迁移 + 两份离线复核数据（会清空本地演示库）
+```
+
+完整流程、逐步输入与预期现象、模型故障时的降级路径见 **[docs/demo.md](docs/demo.md)**。
+演示数据只有 `S-DEMO-*` 脱敏编号，导入文件不含学号列，不含真实姓名学号。
 
 **跑测试**
 

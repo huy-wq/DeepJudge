@@ -1,0 +1,29 @@
+{
+  "items": [
+    {
+      "id": "P1",
+      "hit": true,
+      "level": 1.0,
+      "evidence": "客户端首先发送 SYN 报文",
+      "reason": "写出了 SYN 与序号"
+    },
+    {
+      "id": "P2",
+      "hit": true,
+      "level": 0.5,
+      "evidence": "服务器回复 SYN=1、ACK=1",
+      "reason": "有 SYN+ACK，但没有说明同意接收"
+    },
+    {
+      "id": "P3",
+      "hit": false,
+      "level": 0.0,
+      "evidence": "",
+      "reason": "没有写出第三次 ACK 的序号确认"
+    }
+  ],
+  "deductions": [
+    { "id": "D1", "hit": false, "evidence": "" }
+  ],
+  "comment": "前两步写到了，第三步缺失。"
+}

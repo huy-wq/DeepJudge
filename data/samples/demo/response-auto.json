@@ -1,0 +1,29 @@
+{
+  "items": [
+    {
+      "id": "P1",
+      "hit": true,
+      "level": 0.5,
+      "evidence": "客户端先发一个请求",
+      "reason": "只提到发请求，没有 SYN 与序号"
+    },
+    {
+      "id": "P2",
+      "hit": true,
+      "level": 0.5,
+      "evidence": "服务器同意",
+      "reason": "只有同意，没有 SYN+ACK 字段"
+    },
+    {
+      "id": "P3",
+      "hit": false,
+      "level": 0.0,
+      "evidence": "",
+      "reason": "没有提到第三次握手"
+    }
+  ],
+  "deductions": [
+    { "id": "D1", "hit": false, "evidence": "" }
+  ],
+  "comment": "只描述了大致过程，缺少协议字段。"
+}

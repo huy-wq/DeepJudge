@@ -156,7 +156,7 @@ backend/
 ├── migrations/               # Alembic 迁移脚本（表结构的部署真源）
 ├── alembic.ini
 ├── tests/                    # 纯函数单测 + 合成用例回归
-└── scripts/                  # experiment.py（check / run）、gen_rubric.py、probe_variance.py
+└── scripts/                  # experiment.py（check / run）、seed_demo.py、gen_rubric.py、probe_variance.py
 
 frontend/                     # 管理端（Vue 3 + Vite + TypeScript + Element Plus）
 ├── src/
@@ -515,7 +515,7 @@ system 中的三条硬纪律：
 ### 5.9 管理端骨架
 
 前端做四件事：**登录、路由、把错误说清楚、把业务动作接到已有接口上**。
-标准编辑（#13）、导入/评分（#14）与复核（#15）均已接；剩下的是实验与演示材料。
+标准编辑（#13）、导入/评分（#14）与复核（#15）均已接；演示流程见 `docs/demo.md`，剩下的是真实对照实验数据与论文材料。
 
 | 决定 | 理由 | 代价 |
 | --- | --- | --- |
@@ -637,12 +637,13 @@ B5 在 B3 上加采样与路由。**校准尚未实现**，所以 B5 不能写�
 | 迁移工具 | **已定** Alembic | 表结构代码真源 `store/tables.py`，部署真源 `migrations/`，由测试强制对齐 |
 | 数据库访问 | **已定** SQLAlchemy 2.0 Core + PyMySQL | 只有 `store/` 依赖它；`core/` 与 `pipeline.py` 不碰 SQL |
 | 任务执行 | **已实现** 进程内线程池 | `GRADING_CONCURRENCY`（默认 2，上限 4）。重启时把 running 任务标为 interrupted 并可重试（包括 `failed=0`、只剩 pending 项的任务）；多 worker 部署需换共享队列 |
-| 前端 | **已实现主体** Vue 3 + Vite + TypeScript | Element Plus；Vitest + jsdom；登录、标准编辑、导入与评分、复核队列、证据高亮、改分与批量通过均已接；演示脚本与验收材料待 #17 |
+| 前端 | **已实现** Vue 3 + Vite + TypeScript | Element Plus；Vitest + jsdom；登录、标准编辑、导入与评分、复核队列、证据高亮、改分与批量通过均已接 |
 | 认证 | **已实现** 单口令 + 会话 cookie | 口令存 `ADMIN_PASSWORD`，缺失则启动失败；会话服务端登记，退出即可撤销。会话存内存（重启失效），多进程需换共享存储 |
 | 接口层 | **已实现** FastAPI | 认证、答卷导入、批量任务、复核（队列/详情/改分/批量通过）、评分标准（生成/迭代/保存/列表/按版本打开/实时校验）；管理端业务页已接标准、导入、任务、复核队列与详情 |
 | 任务历史 | **未做** | 任务号只存在当前 URL（`/grading?task=N`），没有任务列表接口；关掉链接后只能从复核队列或数据库找回 |
 | 直接导入 `.xlsx` | **未做** | 页面只收 UTF-8 的 CSV/文本，Excel 需另存为 CSV；二进制解析依赖与 `source` 取值都未加 |
 | 实验与指标 | **已实现** | `app/experiment.py` + `scripts/experiment.py`：B0/B2/B3/B5 四组对照，QWK / MAE / 逐点准确率 / 接地率 / 自动通过率；校准与 ICC 尚未实现 |
+| 演示与验收 | **已实现** | `docs/demo.md` + `scripts/demo.sh`：10 分钟固定流程；两份离线复核数据（`S-DEMO-*`）保证模型故障时仍能演示复核与批量通过 |
 | 部署 | 待定 | 本地演示优先 |
 | 最高档分值是否必须等于权重 | 待定 | 目前只作为 `TOP_LEVEL_BELOW_WEIGHT` **提示**，不拦保存。加硬校验会让"按权重算分"名副其实，但会约束评分标准的写法 |
 

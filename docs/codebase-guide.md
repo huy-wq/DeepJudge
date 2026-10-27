@@ -6,10 +6,10 @@
 >
 > 若两者冲突，以 `docs/architecture.md` 为准；发现冲突请改本文件。
 
-**当前状态**：334 个后端用例（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
+**当前状态**：336 个后端用例（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
 裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归）
-+ 83 个前端用例（Vitest + jsdom，见 §2 ⑮/⑯/⑰/⑱），约 2.4 万行（含文档、测试与锁文件）。
-已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成、#11 标准保存与迭代、#12 前端骨架、#13 标准编辑页、#14 导入与任务页、#15 复核页、#16 合成用例与对照实验。
++ 83 个前端用例（Vitest + jsdom，见 §2 ⑮/⑯/⑰/⑱/⑳），约 2.4 万行（含文档、测试与锁文件）。
+已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成、#11 标准保存与迭代、#12 前端骨架、#13 标准编辑页、#14 导入与任务页、#15 复核页、#16 合成用例与对照实验、#17 演示与验收。
 **没有**的部分见 §8，别在代码里找不存在的东西。
 
 ---
@@ -48,8 +48,8 @@ backend/
 │   ├── cli.py           ← 命令行入口与报告组装
 │   └── config.py        ← .env 读取
 ├── migrations/          ← Alembic 迁移（表结构的部署真源）
-├── tests/               ← 334 个用例
-└── scripts/             ← experiment.py（check / run）、gen_rubric.py、probe_variance.py（方差实测）
+├── tests/               ← 336 个用例
+└── scripts/             ← experiment.py（check / run）、seed_demo.py、demo.sh、gen_rubric.py、probe_variance.py
 
 frontend/                ← 管理端（Vue 3 + Vite + TS + Element Plus）
 ├── src/api/             ← HTTP 客户端（统一错误）、认证、标准、答卷、任务、复核
@@ -1112,6 +1112,47 @@ python3 -m unittest tests.test_experiment_script -v         # 3 个入口用例
 
 ---
 
+### ⑳ 演示与验收：`docs/demo.md` + `scripts/demo.sh` + `seed_demo.py`（约 15 分钟）
+
+**职责**：把"登录 → 生成标准 → 导入 → 评分 → 复核改分 → 批量通过"压成 10 分钟固定流程，
+并保证模型故障时还能演示。
+
+| 位置 | 在干什么 | 读的时候注意 |
+| --- | --- | --- |
+| `docs/demo.md` | 时间线、每步输入、预期现象、降级路径 | 不是 README 的缩写版；答辩当天照着走 |
+| `scripts/demo.sh` | `up` / `seed` / `reset` | `reset` 会清空本地演示库；只用于演示环境 |
+| `backend/scripts/seed_demo.py` | 用离线 provider 写两份结果 | 不调模型；`S-DEMO-01` 必须路由到 human，`S-DEMO-02` 必须 auto |
+| `data/samples/demo/answers.csv` | 导入步骤的文件 | 只有「题号,答案」两列，**没有学号列** |
+| `data/samples/demo/response-*.json` | 两份预置判定 | 证据都取自对应答案原文，复核页能高亮 |
+
+**三处必须看出的设计**：
+
+1. **演示前先 seed，不靠现场评分碰运气。**
+   实时评分不保证产生 `route=human` 的结果；没有待复核数据，"证据高亮 + 改分"就演示不了。
+   预置一份 5 分（接近及格线转人工）和一份 3.5 分（自动通过），保证两条复核路径都有东西可看。
+
+2. **导入文件不带学号列。**
+   演示数据不需要真实身份；`answers.csv` 只有题号与答案，预览里"带学号 0 行"本身就是隐私设计的证据。
+
+3. **模型故障时不伪造实时结果。**
+   降级路径直接进复核页，明确告诉观众"这是离线预置的评分"；命令行另有一条预置响应路径。
+   不把预置结果说成"刚刚模型算的"——这比演示卡住更伤可信度。
+
+**动手验证**：
+
+```bash
+./scripts/demo.sh help
+./scripts/demo.sh reset       # 需要 Docker + MySQL；会清空本地演示库
+cd backend && python3 -m unittest tests.test_seed_demo -v   # 2 个用例
+```
+
+没有 Docker 时按 `docs/demo.md` 的 SQLite 步骤准备。
+
+**读完要能回答**：为什么演示数据要先 seed 两份，而不是等现场评分跑完再看队列？
+（实时结果可能全是 auto，复核页没有待办；演示必须保证"有东西可复核"。）
+
+---
+
 ## 3. 三条主线追踪
 
 读完之后，用这三条主线检验自己是否真的串起来了。每条都给出"该看哪几个文件"。
@@ -1192,6 +1233,7 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 | `test_api_auth.py` | 14 | 401 的三种来源、登录下发 cookie、错口令不透露原因、退出后重放旧 cookie 必须 401 |
 | `test_experiment.py` | 14 | 用例校验、至少一条正确答案、B0/B2/B3 差异、QWK/MAE/通过率/自动通过率 |
 | `test_experiment_script.py` | 3 | `check` 不调模型、无效用例退出码 2、`run` 必须显式 `--live` |
+| `test_seed_demo.py` | 2 | 演示种子只写一份 human / 一份 auto，重复写入被拒绝 |
 
 **前端（Vitest + jsdom）**：`cd frontend && npm run test`
 
@@ -1419,6 +1461,7 @@ Day 2（系统与工程）
 | `docs/roadmap.md` | 想知道"下一步做什么、为什么是这个顺序" |
 | `docs/ticket-notes.md` | 想知道"哪些坑已经踩过"。**读别人修过的 bug 是理解设计边界最快的方式** |
 | `docs/experiments.md` | 想知道"多采样到底有没有用"的实测数据 |
+| `docs/demo.md` | 答辩/验收当天的 10 分钟脚本与降级路径 |
 | `AGENTS.md` | 项目约定（文档语言、提交格式、每工单记录） |
 
 ---
