@@ -46,6 +46,16 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('../views/RubricListView.vue'),
       },
       {
+        path: 'grading',
+        name: 'grading',
+        component: () => import('../views/GradingView.vue'),
+      },
+      {
+        path: 'review',
+        name: 'review',
+        component: () => import('../views/ReviewQueueView.vue'),
+      },
+      {
         path: 'rubrics/new',
         name: 'rubric-new',
         component: () => import('../views/RubricEditorView.vue'),

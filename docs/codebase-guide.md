@@ -6,10 +6,10 @@
 >
 > 若两者冲突，以 `docs/architecture.md` 为准；发现冲突请改本文件。
 
-**当前状态**：315 个后端用例（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
+**当前状态**：317 个后端用例（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
 裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归）
-+ 54 个前端用例（Vitest + jsdom，见 §2 ⑮/⑯），约 13000 行（含文档与测试）。
-已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成、#11 标准保存与迭代、#12 前端骨架、#13 标准编辑页。
++ 73 个前端用例（Vitest + jsdom，见 §2 ⑮/⑯/⑰），约 2.4 万行（含文档、测试与锁文件）。
+已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成、#11 标准保存与迭代、#12 前端骨架、#13 标准编辑页、#14 导入与任务页。
 **没有**的部分见 §8，别在代码里找不存在的东西。
 
 ---
@@ -47,18 +47,20 @@ backend/
 │   ├── cli.py           ← 命令行入口与报告组装
 │   └── config.py        ← .env 读取
 ├── migrations/          ← Alembic 迁移（表结构的部署真源）
-├── tests/               ← 315 个用例
+├── tests/               ← 317 个用例
 └── scripts/             ← 实验脚本（backend/scripts，如方差实测）
 
-frontend/                ← 管理端骨架（Vue 3 + Vite + TS + Element Plus）
-├── src/api/             ← HTTP 客户端（统一错误）与认证接口
+frontend/                ← 管理端（Vue 3 + Vite + TS + Element Plus）
+├── src/api/             ← HTTP 客户端（统一错误）、认证、标准、答卷、任务、复核
 ├── src/router/          ← 路由与登录守卫
 ├── src/session.ts       ← 登录态：服务端 cookie + 一次 /session 确认
 ├── src/feedback.ts      ← 统一错误提示（ElMessage）
-├── src/components/      ← ErrorBoundary（渲染错误不白屏）
+├── src/components/      ← ErrorBoundary；rubrics/ 预览表与校验清单；
+│                          grading/ 导入预览与任务进度
 ├── src/layouts/         ← AdminLayout
-├── src/views/           ← 登录 / 首页 / 标准列表 / 标准编辑 / 404 / 加载失败
-├── tests/               ← 54 个用例（Vitest + jsdom）
+├── src/views/           ← 登录 / 首页 / 标准列表 / 标准编辑 / 导入与评分 /
+│                          复核队列 / 404 / 加载失败
+├── tests/               ← 73 个用例（Vitest + jsdom）
 └── vite.config.ts       ← dev proxy /api → :8000；Vitest 配置
 
 仓库根目录还有：docker-compose.yml（本地 MySQL 8）、scripts/dev-db.sh（一键起库 + 迁移）。
@@ -790,8 +792,8 @@ if claimed == 1:
 
 ```bash
 cd backend
-python3 -m unittest tests.test_tasks -v          # 11 个用例，含并发与重启
-python3 -m unittest tests.test_api_tasks -v      # 9 个用例，HTTP 层
+python3 -m unittest tests.test_tasks -v          # 14 个用例，含并发与重启
+python3 -m unittest tests.test_api_tasks -v      # 15 个用例，HTTP 层
 ```
 
 **读完要能回答**：任务"跑完了但有失败项"，状态应该是 `done` 还是 `failed`？
@@ -880,7 +882,7 @@ python3 -m unittest tests.test_api_rubrics -v    # 26 个用例：生成 → 保
 
 ### ⑮ 前端骨架：`frontend/`（约 30 分钟）
 
-**职责**：登录、路由、把错误说清楚。业务页（标准编辑、导入、评分、复核）留到 #13–#15。
+**职责**：登录、路由、把错误说清楚；标准编辑、导入与评分、复核队列分别在 ⑯/⑰ 与 #15。
 
 | 位置 | 在干什么 | 读的时候注意 |
 | --- | --- | --- |
@@ -890,8 +892,8 @@ python3 -m unittest tests.test_api_rubrics -v    # 26 个用例：生成 → 保
 | `src/router/index.ts` | 路由表 + 全局守卫 + `onError` 回退 | 所有非 public 路由（包括 404）都先确认登录态；chunk 加载失败进 `/load-error`（这个页面在主包里） |
 | `src/feedback.ts` | 统一错误文案与全局提示，可替换 notifier | 登录失败贴在表单旁（不重复弹 toast）；其余错误走全局提示 |
 | `src/components/ErrorBoundary.vue` | 渲染期兜底 | 管理页用内层边界（只换内容区，导航还在）；登录页用外层边界 |
-| `src/layouts/AdminLayout.vue` | 顶栏 + 退出 + 内层 ErrorBoundary | 退出失败时**不**假装已退出；退出请求 401 时由 401 处理送回登录页 |
-| `src/views/LoginView.vue` | 口令表单 | 失败时同时给行内错误与全局提示；空口令不发请求 |
+| `src/layouts/AdminLayout.vue` | 顶栏 + 退出 + 内层 ErrorBoundary | 退出失败时**不**假装已退出；退出请求 401 时由 401 处理送回登录页；边界 key 用 `route.path`，查询参数变化不重置页面 |
+| `src/views/LoginView.vue` | 口令表单 | 失败时只贴行内错误（不重复弹窗）；空口令不发请求 |
 | `vite.config.ts` | dev proxy 与 Vitest 配置 | `/api` → `127.0.0.1:8000`，同源才有 cookie |
 
 **一次刷新的完整链路**：
@@ -913,7 +915,7 @@ python3 -m unittest tests.test_api_rubrics -v    # 26 个用例：生成 → 保
 ```bash
 cd frontend
 npm install
-npm run test        # 54 个用例：守卫、会话、标准编辑、统一错误、退出、ErrorBoundary
+npm run test        # 73 个用例：守卫、会话、标准编辑、导入与任务、复核队列、统一错误、退出
 npm run typecheck
 npm run build
 ```
@@ -958,6 +960,55 @@ npm run test -- tests/rubric-list.test.ts      # 3 个用例：列表、打开�
 
 **读完要能回答**：为什么阻断项要禁用保存，而提示项只要求勾"已知悉"？
 （阻断项是标准本身不成立，存了也评不了分；提示项是"能算分但可能不可靠"，判断权在教师。）
+
+---
+
+### ⑰ 导入与任务页：`src/views/GradingView.vue` + `api/answers.ts` / `api/tasks.ts`（约 30 分钟）
+
+**职责**：把"导入一个班的答卷 → 勾选 → 发起评分 → 看进度 → 交接到复核"串成一页。
+页面不解析 CSV、不自己算分，只把已有接口接起来。
+
+| 位置 | 在干什么 | 读的时候注意 |
+| --- | --- | --- |
+| `api/answers.ts` | 预览 / 导入 / 按题号列答卷 | 预览与导入接收**同一段原文**，不接收客户端回传的行 |
+| `api/tasks.ts` | 建任务 / 查进度 / 重试 | `TaskDetail.state` 是服务端派生好的状态，页面不再拼 `status + route + final_score` |
+| `GradingView.vue:153` `runPreview` | 调预览并同步题号 | 预览不写库；文本一改旧预览就作废 |
+| `:180` `syncQuestionFromPreview` | CSV 的题号来自文件 | 文件题号与当前选择不一致时切题并**重取答卷列表**，否则会拿错题的答卷发起评分 |
+| `:192` `confirmImport` | 确认导入并刷新答卷 | 默认跳过重复；坏行在预览里已可见 |
+| `:227` `onFile` | 选文件 → 填入文本 → 自动预览 | 只收 UTF-8 的 CSV/文本，2 MB 上限；读文件不碰学号 |
+| `:291` `schedulePolling` | 1 秒一次的进度轮询 | 只在 `pending/running` 时继续；失败就停，并留下 `pollError` |
+| `:318` `resumePolling` | 手动继续刷新 | 一次网络抖动不该让进度永远停在"评分中" |
+| `:332` `startTask` | 建任务并把任务号写进 URL | 地址栏是刷新后恢复进度的唯一入口；不存 localStorage |
+| `:365` `retryWith` | 重试全部或单份失败项 | 重试响应可能仍是 `interrupted`，所以强制先读一次 |
+| `:403` watch `route.query.task` | 刷新 / 后退接上任务 | 与 `startTask` 共用同一个任务号；去掉任务号时清掉旧卡片 |
+| `components/grading/PreviewPanel.vue` | 行数、重复、坏行、缺失题号 | 只渲染服务端结果；不显示学号 |
+| `components/grading/TaskProgressPanel.vue` | 进度、逐份状态、重试、去复核 | 状态映射只在这里；`needs_review` 才显示"去复核队列" |
+
+**三处必须看出的设计**：
+
+1. **CSV 不钉题号，单份粘贴才钉。**
+   CSV 的题号由文件里的列决定；页面若再传一个题号，无表头的 3 列文件会被解释成
+   "答案在第 2 列"，静默错位。单份粘贴没有题号列，所以必须先从已保存标准里选。
+
+2. **任务号是地址栏状态，不是本地状态。**
+   `/grading?task=12` 让刷新、前进后退、从复核页返回都能接上同一个任务；代价是没有任务
+   历史列表——换一个任务就找不到旧的，只能从复核队列或数据库找回。
+
+3. **复核页先只做队列。**
+   `/review` 是任务完成后的交接目标：按风险列出待复核结论与原因，但证据高亮、改分、
+   批量通过仍在 #15。不要在 #14 的队列页里找"定稿"按钮。
+
+**动手验证**：
+
+```bash
+cd frontend
+npm run test -- tests/grading.test.ts       # 15 个用例：预览/查重/粘贴/切题/发起/轮询/重试/跳转
+npm run test -- tests/review-queue.test.ts  # 4 个用例：风险列表、题号筛选、空状态、失败态
+```
+
+**读完要能回答**：为什么任务页不自己算"已评 / 待复核 / 已定稿"？
+（这些状态由服务端从 `status`、`route`、`current`、`final_score` 派生；前端再拼一份，
+两个页面迟早拼法不一致。）
 
 ---
 
@@ -1030,7 +1081,7 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 | `test_cli.py` | 5 | 报告字段齐全；错误码；`--save` 能读回 |
 | `test_store.py` | 17 | 字段无损往返；标准快照不可变；重评后按旧运行号不会串到新结论；导入与查重 |
 | `test_tasks.py` | 14 | 并发领取不重复、单份失败隔离、快照固定、失败项可单独重试、重启标中断、**执行器崩溃后任务可重试** |
-| `test_api_tasks.py` | 12 | 建任务/查进度/重试；派生状态 `state`；重复 id 去重；跨题 id 400；未登录 401 |
+| `test_api_tasks.py` | 15 | 建任务/查进度/重试；派生状态 `state`；重复 id 去重；跨题 id 400；未登录 401；中断/未启动的任务能被重试拉起 |
 | `test_reviews.py` | 24 | 队列只列待人工且按 risk 排序；重评后旧结论出队且拒绝定稿；定稿只一次；批量通过只收 `auto`；定稿后改标准不影响 |
 | `test_api_reviews.py` | 25 | 登录保护；详情含证据偏移、逐采样等级与分歧；改分缺意见 400、重复 409、过期 409；批量通过 |
 | `test_migrations.py` | 2 | 迁移建出的表 == `tables.py`（逐列、逐索引、逐外键） |
@@ -1053,6 +1104,8 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 | `tests/rubrics-api.test.ts` | 4 | 校验/保存/列表的请求形状；提示 key 稳定 |
 | `tests/rubric-editor.test.ts` | 14 | 三视图同屏、改行后实时校验、阻断禁用保存、提示需确认、校验失败禁用保存、摘要随编辑更新、迭代/保存互斥、离开确认 |
 | `tests/rubric-list.test.ts` | 3 | 列表、打开某一版、空状态 |
+| `tests/grading.test.ts` | 15 | 预览/查重/坏行/学号不回显、文件自动预览、粘贴题号、CSV 切题、勾选发起、轮询与失败续刷、重试、任务恢复、跳转复核 |
+| `tests/review-queue.test.ts` | 4 | 按风险列队列与原因、题号筛选、空状态、加载失败 |
 
 **测试里的接缝（seam）**，读懂这三个就够了：
 
@@ -1196,11 +1249,12 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 
 | 缺什么 | 属于哪张工单 | 现状 |
 | --- | --- | --- |
-| 复核界面 | #15 | 接口与存储都已落地，`frontend/` 还没有 |
+| 复核详情与定稿 | #15 | 队列列表已在 `/review`；证据高亮、改分、批量通过还没有 |
 | 导入批次撤销 | 未定 | 只能按 answer_id 删；验收只要求"取消导入不产生数据"，已满足 |
 | 分数校准 | 校准层 | `core/calibrate.py` **不存在**；`calibrated_score` 恒为 `NULL` |
 | 模型能力注册表 | 后续 | `providers/registry.py` **不存在** |
-| 导入与任务页 / 复核页 | #14–#15 | 骨架与标准页已在 `frontend/` |
+| 任务历史列表 | 未定 | 任务号只在当前 URL；关掉链接就找不到旧任务 |
+| 直接导入 `.xlsx` | 未定 | 页面只收 UTF-8 的 CSV/文本，Excel 需另存为 CSV |
 | token / 耗时统计 | 后续 | `grading_runs.tokens_in/latency_ms` 列存在但恒为 `NULL` |
 
 ---
@@ -1239,6 +1293,7 @@ Day 2（系统与工程）
   → tests/test_store.py + test_migrations.py（看"字段无损"和"迁移对齐"是怎么被守住的）
   → ⑩ app/main.py → app/auth.py → app/api/deps.py → app/api/routes.py
   → ⑪ app/importing.py → ⑫ app/tasks.py → ⑬ store 的复核段 + app/api/results.py
+  → ⑮ 前端骨架 → ⑯ 标准编辑页 → ⑰ 导入与任务页
   → docs/ticket-notes.md（看 #4–#9 里那些被修掉的 bug，比读正常代码更快理解设计边界）
 ```
 

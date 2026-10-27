@@ -196,6 +196,43 @@ class CreateAndPoll(TaskApiTestCase):
         self.assertEqual(response.status_code, 422)
 
 
+class InterruptedTaskCanResume(TaskApiTestCase):
+    def test_retry_restarts_an_interrupted_task_that_has_only_pending_items(self):
+        """执行器在领取第一份之前就挂了：failed=0，但仍然有活要干。"""
+        answer_ids = self.import_answers([ANSWER])
+        task = self.store.create_task(
+            question_code="Q-01", answer_ids=answer_ids, samples=1
+        )
+        self.store.set_task_status(task.task_id, "interrupted", error="进程重启，任务中断")
+
+        retried = self.client.post(
+            f"/api/tasks/{task.task_id}/retry", json={"answer_ids": []}
+        )
+
+        self.assertEqual(retried.status_code, 200, retried.text)
+        self.assertEqual(retried.json()["reset"], 0)
+        final = self.wait_for(task.task_id)
+        self.assertEqual(final["status"], "done")
+        self.assertEqual(final["items"][0]["state"], "graded")
+
+    def test_retry_starts_a_task_that_never_started(self):
+        """任务状态还是 pending、没有一个失败项：重试也必须真的把执行器拉起来。"""
+        answer_ids = self.import_answers([ANSWER])
+        task = self.store.create_task(
+            question_code="Q-01", answer_ids=answer_ids, samples=1
+        )
+        self.assertEqual(self.store.get_task(task.task_id).status, "pending")
+
+        retried = self.client.post(
+            f"/api/tasks/{task.task_id}/retry", json={"answer_ids": []}
+        )
+
+        self.assertEqual(retried.status_code, 200, retried.text)
+        self.assertEqual(retried.json()["reset"], 0)
+        final = self.wait_for(task.task_id)
+        self.assertEqual(final["status"], "done")
+
+
 class OneFailureDoesNotStopTheBatch(TaskApiTestCase):
     def test_failed_item_is_isolated_and_reports_a_reason(self):
         answer_ids = self.import_answers([ANSWER, "会失败的答卷", ANSWER + " 补充一句"])

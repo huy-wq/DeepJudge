@@ -32,6 +32,8 @@ async function handleLogout(): Promise<void> {
       <nav class="nav">
         <router-link to="/" data-test="nav-home">首页</router-link>
         <router-link to="/rubrics" data-test="nav-rubrics">评分标准</router-link>
+        <router-link to="/grading" data-test="nav-grading">导入与评分</router-link>
+        <router-link to="/review" data-test="nav-review">复核</router-link>
       </nav>
       <span class="spacer" />
       <el-button text :loading="leaving" data-test="logout" @click="handleLogout">
@@ -40,8 +42,9 @@ async function handleLogout(): Promise<void> {
     </el-header>
 
     <el-main class="admin-main">
-      <!-- 页面渲染出错时只替换内容区：顶栏与退出按钮还在，教师可以换页面 -->
-      <ErrorBoundary :key="route.fullPath">
+      <!-- key 用 path 而不是 fullPath：查询参数变化（如任务号）不该重置整页状态；
+           出错换页面时 path 必然变化，兜底仍然有效 -->
+      <ErrorBoundary :key="route.path">
         <router-view />
       </ErrorBoundary>
     </el-main>

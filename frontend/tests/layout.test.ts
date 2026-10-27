@@ -64,7 +64,13 @@ describe('管理端骨架', () => {
         {
           path: '/',
           component: AdminLayout,
-          children: [{ path: '', component: Boom }],
+          children: [
+            { path: '', component: Boom },
+            // 导航里有这些链接；补上空路由，避免测试输出被 "No match" 警告淹没
+            { path: 'rubrics', component: { template: '<div />' } },
+            { path: 'grading', component: { template: '<div />' } },
+            { path: 'review', component: { template: '<div />' } },
+          ],
         },
       ],
     })

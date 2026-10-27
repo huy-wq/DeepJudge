@@ -104,7 +104,10 @@ def register(app: FastAPI) -> None:
             )
 
         reset = store.reset_failed_items(task_id, answer_ids=payload.answer_ids or None)
-        if reset:
+        # reset 为 0 不等于"没有活可干"：进程在执行器领取答卷之前中断时，
+        # 所有 item 还是 pending、failed=0，此时仍然要把任务重新交给执行器；
+        # 只按 reset 判断会让这种任务永远停在 interrupted。
+        if reset or task.status in {"interrupted", "pending"}:
             runner.start(task_id)
         refreshed = store.get_task(task_id)
         return {
