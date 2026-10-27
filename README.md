@@ -131,6 +131,26 @@ JSON
 
 入库要求题号已存在（保存评分标准时会创建题目）。样例文件见 `data/samples/tcp-handshake/answers.csv`。
 
+**批量评分（后台任务 + 轮询进度）**
+
+```bash
+# 建任务：任务启动时固定当前标准，之后改标准不影响本批次
+curl -s -b /tmp/c.txt -X POST http://127.0.0.1:8000/api/tasks \
+  -H 'content-type: application/json' \
+  -d '{"question_code":"Q-01","answer_ids":[2,3],"samples":1}'
+
+# 查进度：每份答卷的状态、分数与路由（"待复核"由 route 派生）
+curl -s -b /tmp/c.txt http://127.0.0.1:8000/api/tasks/1
+
+# 只重试失败的那几份（空数组表示本任务全部失败项）
+curl -s -b /tmp/c.txt -X POST http://127.0.0.1:8000/api/tasks/1/retry \
+  -H 'content-type: application/json' -d '{"answer_ids":[]}'
+```
+
+单份失败不会中断整批：它会被标成 `failed` 并附上原因，其余照常评完。
+任务跑在进程内线程池里（`GRADING_CONCURRENCY`，默认 2），进程重启后残留的 running 任务会被标为
+`interrupted` 并可重试。
+
 **先把教师的一段口述变成结构化标准**
 
 ```bash

@@ -202,6 +202,75 @@ aggregated_results = Table(
     **MYSQL_TABLE_ARGS,
 )
 
+grading_tasks = Table(
+    "grading_tasks",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "question_id",
+        Integer,
+        ForeignKey("questions.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "rubric_id",
+        Integer,
+        ForeignKey("rubrics.id", ondelete="RESTRICT"),
+        nullable=False,
+        comment="任务启动时固定下来的标准快照：之后改标准不影响本批次",
+    ),
+    Column("samples", Integer, nullable=False, server_default="3"),
+    Column("status", String(16), nullable=False, server_default="pending",
+           comment="pending / running / done / interrupted"),
+    Column("total", Integer, nullable=False, server_default="0"),
+    Column("done", Integer, nullable=False, server_default="0"),
+    Column("failed", Integer, nullable=False, server_default="0"),
+    Column(
+        "error",
+        String(255),
+        nullable=True,
+        comment="任务级失败原因（执行器崩溃、进程中断）；单份失败记在 task_items.error",
+    ),
+    Column("created_at", DateTime, nullable=False, server_default=func.now()),
+    Column("started_at", DateTime, nullable=True),
+    Column("finished_at", DateTime, nullable=True),
+    Index("ix_tasks_question", "question_id"),
+    Index("ix_tasks_status", "status"),
+    **MYSQL_TABLE_ARGS,
+)
+
+task_items = Table(
+    "task_items",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "task_id",
+        Integer,
+        ForeignKey("grading_tasks.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "answer_id",
+        Integer,
+        ForeignKey("answers.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("status", String(16), nullable=False, server_default="pending",
+           comment="pending / running / graded / failed"),
+    Column("error", String(255), nullable=True),
+    Column(
+        "aggregate_id",
+        Integer,
+        ForeignKey("aggregated_results.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="评完后指向聚合结果；待复核由该行的 route 派生，不在本表另存",
+    ),
+    Column("updated_at", DateTime, nullable=False, server_default=func.now()),
+    UniqueConstraint("task_id", "answer_id", name="uq_task_items_task_answer"),
+    Index("ix_task_items_task_status", "task_id", "status"),
+    **MYSQL_TABLE_ARGS,
+)
+
 reviews = Table(
     "reviews",
     metadata,

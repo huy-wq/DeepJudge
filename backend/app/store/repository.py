@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, func, select
+from sqlalchemy import Engine, create_engine, event, func, select
 from sqlalchemy.pool import StaticPool
 
 from ..core.aggregate import Aggregate
@@ -30,9 +30,11 @@ from .tables import (
     aggregated_results,
     answers,
     grading_runs,
+    grading_tasks,
     item_results,
     questions,
     rubrics,
+    task_items,
 )
 
 
@@ -42,6 +44,9 @@ KIND_DEDUCTION = "deduction"
 
 # 未提供学号时的脱敏占位符。表里还有一个 SQL 默认值，两处必须一致。
 DEFAULT_PSEUDO_ID = "anon"
+
+# task_items.error 与 grading_tasks.error 都是 String(255)，留一点余量
+MAX_ERROR_CHARS = 250
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,29 @@ class ImportOutcome:
 
 
 @dataclass(frozen=True)
+class TaskRecord:
+    task_id: int
+    question_code: str
+    rubric_id: int
+    samples: int
+    status: str
+    total: int
+    done: int
+    failed: int
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class TaskItem:
+    item_id: int
+    task_id: int
+    answer_id: int
+    status: str
+    error: str | None
+    aggregate_id: int | None
+
+
+@dataclass(frozen=True)
 class StoredEvaluation:
     """保存结果，也是读回的返回类型。
 
@@ -115,6 +143,21 @@ class StoredEvaluation:
     normalized_text: str
     runs: list[RunRecord]
     evaluation: Evaluation
+
+
+def _enable_sqlite_foreign_keys(engine: Engine) -> None:
+    """SQLite 默认**不**检查外键；MySQL 检查。
+
+    不打开它，测试就会放过"插入一条指向不存在答卷的 task_item"这种数据损坏，
+    等到换 MySQL 部署才炸。让测试库尽量贴近生产库的行为。
+    """
+
+    @event.listens_for(engine, "connect")
+    def _on_connect(dbapi_connection, connection_record):  # noqa: ANN001
+        del connection_record
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 
 def _checksum(payload: dict[str, Any]) -> str:
@@ -163,11 +206,19 @@ class Store:
     @classmethod
     def from_url(cls, url: str, *, echo: bool = False) -> "Store":
         kwargs: dict[str, Any] = {"echo": echo}
-        # 内存库必须共享同一个连接，否则每次 connect 都是一个空的库。
-        if url.startswith("sqlite") and ":memory:" in url:
-            kwargs["poolclass"] = StaticPool
-            kwargs["connect_args"] = {"check_same_thread": False}
-        return cls(create_engine(url, **kwargs))
+        if url.startswith("sqlite"):
+            # 内存库必须共享同一个连接，否则每次 connect 都是一个空的库。
+            # 文件库则相反：每个线程要自己的连接（批量任务是多线程写的），
+            # 并用 timeout 容忍短暂的写锁竞争。
+            if ":memory:" in url:
+                kwargs["poolclass"] = StaticPool
+                kwargs["connect_args"] = {"check_same_thread": False}
+            else:
+                kwargs["connect_args"] = {"check_same_thread": False, "timeout": 15}
+        engine = create_engine(url, **kwargs)
+        if url.startswith("sqlite"):
+            _enable_sqlite_foreign_keys(engine)
+        return cls(engine)
 
     @property
     def engine(self) -> Engine:
@@ -205,49 +256,13 @@ class Store:
                 )
             ).inserted_primary_key[0]
 
-            run_ids: list[int] = []
-            for sample in evaluation.samples:
-                run_id = conn.execute(
-                    grading_runs.insert().values(
-                        answer_id=answer_id,
-                        rubric_id=rubric_id,
-                        prompt_version=meta.prompt_version,
-                        model=meta.model,
-                        params_json=dict(meta.params),
-                        status=meta.status,
-                        score=sample.score,
-                        comment=sample.comment,
-                        tokens_in=meta.tokens_in,
-                        tokens_out=meta.tokens_out,
-                        latency_ms=meta.latency_ms,
-                        error=meta.error,
-                    )
-                ).inserted_primary_key[0]
-                run_ids.append(run_id)
-                self._insert_judgements(conn, run_id, sample)
-
-            combined = evaluation.aggregate
-            aggregate_id = conn.execute(
-                aggregated_results.insert().values(
-                    answer_id=answer_id,
-                    rubric_id=rubric_id,
-                    sample_run_ids=run_ids,
-                    levels_json=combined.levels,
-                    sample_totals_json=combined.sample_totals,
-                    raw_score=combined.score,
-                    calibrated_score=None,
-                    max_score=combined.max_score,
-                    dispersion=combined.dispersion,
-                    total_range=combined.total_range,
-                    confidence=combined.confidence,
-                    grounding_rate=combined.grounding_rate,
-                    route=evaluation.route.route,
-                    risk=evaluation.route.risk,
-                    reasons_json=evaluation.route.reasons,
-                    applied_deductions_json=combined.applied_deductions,
-                    calibration_version=None,
-                )
-            ).inserted_primary_key[0]
+            run_ids, aggregate_id = self._save_runs_and_aggregate(
+                conn,
+                answer_id=answer_id,
+                rubric_id=rubric_id,
+                evaluation=evaluation,
+                meta=meta,
+            )
 
         return StoredEvaluation(
             answer_id=answer_id,
@@ -276,6 +291,124 @@ class Store:
             ],
             evaluation=evaluation,
         )
+
+    def save_evaluation_for_answer(
+        self,
+        *,
+        answer_id: int,
+        rubric: Rubric,
+        evaluation: Evaluation,
+        meta: RunMeta | None = None,
+        rubric_id: int | None = None,
+    ) -> StoredEvaluation:
+        """给**已存在**的答卷打分并落库（批量任务走这条路）。
+
+        与 `save_evaluation` 的区别有两点：不再插入 `answers` 行（答卷是导入进来的）；
+        可以用 `rubric_id` 指定**任务级快照**，而不是按内容去找/建版本——
+        否则标准改过以后，这里会拿旧内容再插入一个新版本，导致
+        `aggregate.rubric_id` 与 `task.rubric_id` 不是同一行。
+        """
+        meta = meta or RunMeta()
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                select(answers.c.question_id, answers.c.raw_text, answers.c.student_pseudo_id)
+                .where(answers.c.id == answer_id)
+            ).first()
+            if row is None:
+                raise QuestionNotFound(f"答卷不存在：{answer_id}")
+            question_id = row[0]
+            if rubric_id is None:
+                rubric_id = self._ensure_rubric(conn, question_id, rubric)
+            run_ids, aggregate_id = self._save_runs_and_aggregate(
+                conn,
+                answer_id=answer_id,
+                rubric_id=rubric_id,
+                evaluation=evaluation,
+                meta=meta,
+            )
+
+        return StoredEvaluation(
+            answer_id=answer_id,
+            rubric_id=rubric_id,
+            aggregate_id=aggregate_id,
+            run_ids=run_ids,
+            rubric=rubric,
+            answer_text=row[1],
+            student_pseudo_id=row[2],
+            truncated=False,
+            normalized_text=normalize_with_map(row[1])[0],
+            runs=[
+                RunRecord(
+                    run_id=run_id,
+                    rubric_id=rubric_id,
+                    model=meta.model,
+                    prompt_version=meta.prompt_version,
+                    params=dict(meta.params),
+                    status=meta.status,
+                    error=meta.error,
+                    tokens_in=meta.tokens_in,
+                    tokens_out=meta.tokens_out,
+                    latency_ms=meta.latency_ms,
+                )
+                for run_id in run_ids
+            ],
+            evaluation=evaluation,
+        )
+
+    def _save_runs_and_aggregate(
+        self,
+        conn,
+        *,
+        answer_id: int,
+        rubric_id: int,
+        evaluation: Evaluation,
+        meta: "RunMeta",
+    ) -> tuple[list[int], int]:
+        """写 N 次运行 + 逐条判定 + 聚合结果。批次评分与单份评分共用这一段。"""
+        run_ids: list[int] = []
+        for sample in evaluation.samples:
+            run_id = conn.execute(
+                grading_runs.insert().values(
+                    answer_id=answer_id,
+                    rubric_id=rubric_id,
+                    prompt_version=meta.prompt_version,
+                    model=meta.model,
+                    params_json=dict(meta.params),
+                    status=meta.status,
+                    score=sample.score,
+                    comment=sample.comment,
+                    tokens_in=meta.tokens_in,
+                    tokens_out=meta.tokens_out,
+                    latency_ms=meta.latency_ms,
+                    error=meta.error,
+                )
+            ).inserted_primary_key[0]
+            run_ids.append(run_id)
+            self._insert_judgements(conn, run_id, sample)
+
+        combined = evaluation.aggregate
+        aggregate_id = conn.execute(
+            aggregated_results.insert().values(
+                answer_id=answer_id,
+                rubric_id=rubric_id,
+                sample_run_ids=run_ids,
+                levels_json=combined.levels,
+                sample_totals_json=combined.sample_totals,
+                raw_score=combined.score,
+                calibrated_score=None,
+                max_score=combined.max_score,
+                dispersion=combined.dispersion,
+                total_range=combined.total_range,
+                confidence=combined.confidence,
+                grounding_rate=combined.grounding_rate,
+                route=evaluation.route.route,
+                risk=evaluation.route.risk,
+                reasons_json=evaluation.route.reasons,
+                applied_deductions_json=combined.applied_deductions,
+                calibration_version=None,
+            )
+        ).inserted_primary_key[0]
+        return run_ids, aggregate_id
 
     def _ensure_question(self, conn, rubric: Rubric) -> int:
         row = conn.execute(
@@ -494,6 +627,23 @@ class Store:
                 )
             ).scalar_one()
 
+    def _recount(self, conn, task_id: int, **extra: Any) -> None:
+        """按 task_items 的真实状态重算 done/failed（重置、中断之后必须调）。"""
+        counts = conn.execute(
+            select(task_items.c.status, func.count())
+            .where(task_items.c.task_id == task_id)
+            .group_by(task_items.c.status)
+        ).all()
+        by_status = {status: count for status, count in counts}
+        values: dict[str, Any] = {
+            "done": by_status.get("graded", 0),
+            "failed": by_status.get("failed", 0),
+            **extra,
+        }
+        conn.execute(
+            grading_tasks.update().where(grading_tasks.c.id == task_id).values(**values)
+        )
+
     def _question_row(self, conn, code: str) -> dict[str, Any] | None:
         row = conn.execute(
             select(questions.c.id, questions.c.code, questions.c.stem, questions.c.total_score)
@@ -530,6 +680,366 @@ class Store:
             if (match := re.fullmatch(r"S-(\d+)", pid or ""))
         ]
         return max(numbers) + 1 if numbers else 1
+
+    # ------------------------------------------------------------------ 批量任务
+
+    def get_answer(self, answer_id: int) -> dict[str, Any] | None:
+        """取一份答卷的原文与题号（评分任务要用）。"""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(
+                    answers.c.id,
+                    answers.c.raw_text,
+                    answers.c.student_pseudo_id,
+                    questions.c.code,
+                )
+                .select_from(answers.join(questions, answers.c.question_id == questions.c.id))
+                .where(answers.c.id == answer_id)
+            ).first()
+        if row is None:
+            return None
+        return {
+            "answer_id": row[0],
+            "raw_text": row[1],
+            "pseudo_id": row[2],
+            "question_code": row[3],
+        }
+
+    def load_rubric(self, rubric_id: int) -> Rubric | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(rubrics.c.schema_json).where(rubrics.c.id == rubric_id)
+            ).first()
+        if row is None:
+            return None
+        return from_dict(row[0])
+
+    def create_task(
+        self,
+        *,
+        question_code: str,
+        answer_ids: list[int],
+        samples: int,
+    ) -> TaskRecord:
+        """建任务并**固定当前最新标准**。之后教师再改标准，本批次不受影响。"""
+        # 去重但保持顺序：前端勾选重复时会传两次同一个 id，
+        # 不去重的话 total 会偏大，插入时还会撞 (task_id, answer_id) 唯一约束
+        answer_ids = list(dict.fromkeys(answer_ids))
+        if not answer_ids:
+            raise ValueError("至少要选一份答卷")
+        with self._engine.begin() as conn:
+            question = self._question_row(conn, question_code)
+            if question is None:
+                raise QuestionNotFound(f"题号不存在：{question_code}")
+            latest = conn.execute(
+                select(rubrics.c.id)
+                .where(rubrics.c.question_id == question["id"])
+                .order_by(rubrics.c.version.desc())
+                .limit(1)
+            ).first()
+            # 题目只会在保存标准时创建，所以"题目在、标准没有"不该出现；
+            # 真出现说明库被绕过写入流程改过，直接报错比猜更安全。
+            if latest is None:
+                raise QuestionNotFound(f"题号 {question_code} 没有任何评分标准版本")
+            rubric_id = latest[0]
+
+            # 校验答卷确实属于这道题：否则会插进一条指向不存在答卷的 task_item，
+            # SQLite 不查外键时它还会静默成功，等到列表里"少一份"才发现。
+            found = conn.execute(
+                select(answers.c.id).where(
+                    answers.c.id.in_(answer_ids),
+                    answers.c.question_id == question["id"],
+                )
+            ).scalars().all()
+            missing = sorted(set(answer_ids) - set(found))
+            if missing:
+                raise ValueError(
+                    "这些答卷不存在或不属于题号 "
+                    f"{question_code}：{'、'.join(str(i) for i in missing)}"
+                )
+
+            task_id = conn.execute(
+                grading_tasks.insert().values(
+                    question_id=question["id"],
+                    rubric_id=rubric_id,
+                    samples=samples,
+                    status="pending",
+                    total=len(answer_ids),
+                    done=0,
+                    failed=0,
+                )
+            ).inserted_primary_key[0]
+            conn.execute(
+                task_items.insert(),
+                [
+                    {"task_id": task_id, "answer_id": answer_id, "status": "pending"}
+                    for answer_id in answer_ids
+                ],
+            )
+        return TaskRecord(
+            task_id=task_id,
+            question_code=question_code,
+            rubric_id=rubric_id,
+            samples=samples,
+            status="pending",
+            total=len(answer_ids),
+            done=0,
+            failed=0,
+        )
+
+    def get_task(self, task_id: int) -> TaskRecord | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(
+                    grading_tasks.c.id,
+                    grading_tasks.c.rubric_id,
+                    grading_tasks.c.samples,
+                    grading_tasks.c.status,
+                    grading_tasks.c.total,
+                    grading_tasks.c.done,
+                    grading_tasks.c.failed,
+                    grading_tasks.c.error,
+                    questions.c.code,
+                )
+                .select_from(
+                    grading_tasks.join(questions, grading_tasks.c.question_id == questions.c.id)
+                )
+                .where(grading_tasks.c.id == task_id)
+            ).first()
+        if row is None:
+            return None
+        return TaskRecord(
+            task_id=row[0],
+            question_code=row[8],
+            rubric_id=row[1],
+            samples=row[2],
+            status=row[3],
+            total=row[4],
+            done=row[5],
+            failed=row[6],
+            error=row[7],
+        )
+
+    def list_task_items(self, task_id: int) -> list[TaskItem]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(
+                    task_items.c.id,
+                    task_items.c.task_id,
+                    task_items.c.answer_id,
+                    task_items.c.status,
+                    task_items.c.error,
+                    task_items.c.aggregate_id,
+                )
+                .where(task_items.c.task_id == task_id)
+                .order_by(task_items.c.id)
+            ).all()
+        return [
+            TaskItem(
+                item_id=row[0],
+                task_id=row[1],
+                answer_id=row[2],
+                status=row[3],
+                error=row[4],
+                aggregate_id=row[5],
+            )
+            for row in rows
+        ]
+
+    def claim_next_item(self, task_id: int) -> TaskItem | None:
+        """把下一个待评的答卷标记为 running 并返回。
+
+        用"先读候选、再带条件更新"的 CAS 循环，而不是先 UPDATE 再看结果：
+        两个 worker 可能同时读到同一行 pending，带 `status='pending'` 条件的 UPDATE
+        只有第一个能改成功（rowcount=1），第二个会重试到下一条。
+        单进程下也能用锁解决，但 CAS 在 MySQL 多进程部署时同样成立。
+        """
+        # 正常一两轮就抢到或返回 None；上限只为防御"读到却被删"这种怪状态，别真的空转
+        for _ in range(1000):
+            with self._engine.begin() as conn:
+                row = conn.execute(
+                    select(task_items.c.id, task_items.c.answer_id)
+                    .where(task_items.c.task_id == task_id, task_items.c.status == "pending")
+                    .order_by(task_items.c.id)
+                    .limit(1)
+                ).first()
+                if row is None:
+                    return None
+                claimed = conn.execute(
+                    task_items.update()
+                    .where(task_items.c.id == row[0], task_items.c.status == "pending")
+                    .values(status="running", updated_at=func.now())
+                ).rowcount
+                if claimed == 1:
+                    return TaskItem(
+                        item_id=row[0],
+                        task_id=task_id,
+                        answer_id=row[1],
+                        status="running",
+                        error=None,
+                        aggregate_id=None,
+                    )
+            # 被别人抢走了，回到循环再取一条
+        return None
+
+    def finish_task_item(
+        self,
+        item_id: int,
+        *,
+        status: str,
+        aggregate_id: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        """记录一份答卷的结局，并用**增量**方式维护任务的完成/失败计数。
+
+        不用"查出来再写回去"：MySQL 默认隔离级别下，两个 worker 同时完成会互相覆盖。
+        `done = done + 1` 是原子操作，谁先谁后都不会丢。
+        """
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                select(task_items.c.task_id, task_items.c.status).where(
+                    task_items.c.id == item_id
+                )
+            ).first()
+            if row is None:
+                return
+            task_id, previous = row
+            conn.execute(
+                task_items.update()
+                .where(task_items.c.id == item_id)
+                .values(
+                    status=status,
+                    aggregate_id=aggregate_id,
+                    error=(error[:MAX_ERROR_CHARS] if error else None),
+                    updated_at=func.now(),
+                )
+            )
+            # 只有"从别的状态变成 graded/failed"才加一，重复落同一条不会把计数刷爆
+            if status == "graded" and previous != "graded":
+                conn.execute(
+                    grading_tasks.update()
+                    .where(grading_tasks.c.id == task_id)
+                    .values(done=grading_tasks.c.done + 1)
+                )
+            elif status == "failed" and previous != "failed":
+                conn.execute(
+                    grading_tasks.update()
+                    .where(grading_tasks.c.id == task_id)
+                    .values(failed=grading_tasks.c.failed + 1)
+                )
+
+    def task_item_views(self, task_id: int) -> list[dict[str, Any]]:
+        """任务里每份答卷的状态 + 分数 + 路由。
+
+        "待复核"不单独存状态：它就是 `aggregated_results.route == 'human'`，
+        存两份迟早会出现"状态说已评、路由说待复核"的自相矛盾。
+        """
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(
+                    task_items.c.answer_id,
+                    answers.c.student_pseudo_id,
+                    task_items.c.status,
+                    task_items.c.error,
+                    task_items.c.aggregate_id,
+                    aggregated_results.c.raw_score,
+                    aggregated_results.c.max_score,
+                    aggregated_results.c.route,
+                    aggregated_results.c.confidence,
+                )
+                .select_from(
+                    task_items.join(answers, task_items.c.answer_id == answers.c.id).outerjoin(
+                        aggregated_results,
+                        task_items.c.aggregate_id == aggregated_results.c.id,
+                    )
+                )
+                .where(task_items.c.task_id == task_id)
+                .order_by(task_items.c.id)
+            ).all()
+        return [
+            {
+                "answer_id": row[0],
+                "pseudo_id": row[1],
+                "status": row[2],
+                "error": row[3],
+                "aggregate_id": row[4],
+                "score": row[5],
+                "max_score": row[6],
+                "route": row[7],
+                "confidence": row[8],
+            }
+            for row in rows
+        ]
+
+    def set_task_status(self, task_id: int, status: str, *, error: str | None = None) -> None:
+        values: dict[str, Any] = {"status": status}
+        if error is not None:
+            values["error"] = error[:MAX_ERROR_CHARS]
+        if status == "running":
+            values["started_at"] = func.now()
+        if status in {"done", "interrupted"}:
+            values["finished_at"] = func.now()
+        with self._engine.begin() as conn:
+            conn.execute(
+                grading_tasks.update().where(grading_tasks.c.id == task_id).values(**values)
+            )
+
+    def reset_failed_items(self, task_id: int, *, answer_ids: list[int] | None = None) -> int:
+        """把失败项放回 pending，供重试。返回重置了几条。
+
+        `answer_ids` 为空表示"这一批所有失败项"；给了就只重置这几份
+        （验收要的"失败项可单独重试"）。
+        """
+        with self._engine.begin() as conn:
+            conditions = [
+                task_items.c.task_id == task_id,
+                task_items.c.status == "failed",
+            ]
+            if answer_ids:
+                conditions.append(task_items.c.answer_id.in_(answer_ids))
+            rows = conn.execute(select(task_items.c.id).where(*conditions)).scalars().all()
+            if not rows:
+                return 0
+            conn.execute(
+                task_items.update()
+                .where(task_items.c.id.in_(rows))
+                .values(status="pending", error=None, updated_at=func.now())
+            )
+            # 重算而不是清零：只重试子集时，其余失败项还在
+            self._recount(conn, task_id, status="pending", finished_at=None)
+        return len(rows)
+
+    def mark_interrupted_tasks(self) -> int:
+        """进程重启后，把停在 running 的任务标为 interrupted。
+
+        不做这一步，任务会永远显示"进行中"，教师以为它还在跑。
+        """
+        with self._engine.begin() as conn:
+            running = conn.execute(
+                select(grading_tasks.c.id).where(grading_tasks.c.status == "running")
+            ).scalars().all()
+            if not running:
+                return 0
+            conn.execute(
+                grading_tasks.update()
+                .where(grading_tasks.c.id.in_(running))
+                .values(
+                    status="interrupted",
+                    error="进程重启，任务中断（可重试）",
+                    finished_at=func.now(),
+                )
+            )
+            conn.execute(
+                task_items.update()
+                .where(
+                    task_items.c.task_id.in_(running), task_items.c.status == "running"
+                )
+                .values(status="failed", error="进程重启，任务中断", updated_at=func.now())
+            )
+            for task_id in running:
+                # 不重算的话，任务会显示 failed=0 而每一份其实都失败了
+                self._recount(conn, task_id)
+        return len(running)
 
     # ------------------------------------------------------------------ 读取
 

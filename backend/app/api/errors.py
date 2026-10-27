@@ -33,7 +33,8 @@ def register(app: FastAPI) -> None:
             for error in exc.errors()
         )
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            # 直接用数字：starlette 正在改这个常量的名字（两个名字都在弃用边缘）
+            status_code=422,
             content={"detail": fields or "请求格式不正确", "code": "INVALID_REQUEST"},
         )
 

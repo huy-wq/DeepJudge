@@ -4,6 +4,9 @@ from __future__ import annotations
 
 
 class CannedProvider:
+    # 离线假 provider 没有真实模型可报，审计里就留空
+    model_name = ""
+
     def __init__(self, responses: list[str] | str) -> None:
         self._responses = [responses] if isinstance(responses, str) else list(responses)
         self.calls = 0

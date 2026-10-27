@@ -92,6 +92,7 @@ backend/
 │   ├── api/
 │   │   ├── routes.py         # 登录 / 退出 / 会话 / 健康检查
 │   │   ├── answers.py        # 答卷导入：预览与入库
+│   │   ├── tasks.py          # 批量任务：创建 / 进度 / 重试
 │   │   ├── deps.py           # 认证依赖（401）与数据库依赖（503）
 │   │   ├── errors.py         # 领域异常 → 状态码；422 不回显请求内容
 │   │   └── schemas.py        # 请求响应模型（pydantic）
@@ -112,8 +113,9 @@ backend/
 │   │   └── <vendor>.py       # 各供应商实现
 │   ├── pipeline.py           # 编排：调用 → 解析 → 校验 → 服务端算分
 │   ├── rubric_gen.py         # 编排：5.2 自然语言 → 结构化标准草稿（含一次重试与三视图）
+│   ├── tasks.py              # 编排：批量评分任务的线程池执行器
 │   └── store/                # 存储层（MySQL 8）
-│       ├── tables.py         # 8 张表的定义；方言差异收在 with_variant 里
+│       ├── tables.py         # 10 张表的定义；方言差异收在 with_variant 里
 │       ├── repository.py     # 写入（一个事务）与读取（还原成领域对象）
 │       └── __init__.py       # 对外暴露 Store、RunMeta/RunRecord、StoredEvaluation、
 │                             #   ImportOutcome、QuestionNotFound（metadata 给迁移用）
@@ -132,6 +134,7 @@ backend/
 | 编排 | `importing.py` | 仅标准库（不碰库、不碰 HTTP） |
 | 编排 | `pipeline.py` | core、providers |
 | 编排 | `rubric_gen.py` | core、providers |
+| 编排 | `tasks.py` | core、providers、store |
 | 编排 | `store/repository.py` | core、providers，以及 `pipeline.Evaluation`（"一次评分的产出"这个类型由 pipeline 定义） |
 | 领域逻辑 | `core/*` | 仅标准库 + pydantic |
 | 适配 | `providers/*`（厂商 SDK）、`store/tables.py`（SQLAlchemy 方言） | 外部依赖 |
@@ -217,6 +220,9 @@ grading_runs(id, answer_id, rubric_id, prompt_version, model, params_json, statu
              score, comment, tokens_in, tokens_out, latency_ms, error, created_at)
 item_results(id, run_id, kind, rubric_item_id, level, hit, evidence,
              span_start, span_end, grounded, reason)
+grading_tasks(id, question_id, rubric_id, samples, status, total, done, failed,
+              error, created_at, started_at, finished_at)
+task_items(id, task_id, answer_id, status, error, aggregate_id, updated_at)
 aggregated_results(id, answer_id, rubric_id, sample_run_ids, levels_json, sample_totals_json,
                    raw_score, calibrated_score, max_score, dispersion, total_range,
                    confidence, grounding_rate, route, risk, reasons_json,
@@ -240,6 +246,12 @@ calibration_models(id, version, method, params_json, train_size, metrics_json, c
 | `answers.source` ∈ `csv` / `paste` | 答卷是批量导入还是单份补录，出问题时能区分 |
 | `content_hash` 的空串是历史遗留 | 加这一列之前写入的行拿不到指纹（迁移不会去重算）。**代价：这些行查不出重复**，需要时跑一次回填脚本（尚未提供） |
 | `calibrated_score` 与 `calibration_version` 校准上线前恒为 `NULL` | 字段先留，语义不含糊：`NULL` 就是"没校准"，不是"校准为 0" |
+| `grading_tasks.rubric_id` 是**任务级快照** | 任务一建就固定标准，之后教师改标准不影响本批次（架构 §5.5） |
+| `task_items` 不存"待复核" | 待复核 = `aggregated_results.route == 'human'`。存两份迟早出现"状态说已评、路由说待复核"的矛盾 |
+| `task_items` 的 claim 用 CAS | 先读候选、再带 `status='pending'` 条件更新；两个 worker 抢同一行时只有一个 rowcount=1 |
+| 计数用 `done = done + 1` 增量，不做"查出来再写回" | 两个 worker 同时完成时，覆盖式写入会丢掉一次 |
+| `grading_tasks.error` 只记**任务级**失败 | 单份失败在 `task_items.error`；执行器崩溃 / 进程中断才写任务级 |
+| 接口里的 `state` 是**派生**的 | `graded` 且 `route=human` → `needs_review`。数据库不存它，但接口必须给出，否则前端要自己拼两种字段 |
 
 `student_pseudo_id` 是脱敏占位符，不存姓名学号。审计日志与申诉表留到有真实用户时再加。
 
@@ -464,7 +476,7 @@ system 中的三条硬纪律：
 | 存储 | **已实现** MySQL 8 | `utf8mb4` / InnoDB；表结构见 4.4，逻辑模型与库无关 |
 | 迁移工具 | **已定** Alembic | 表结构代码真源 `store/tables.py`，部署真源 `migrations/`，由测试强制对齐 |
 | 数据库访问 | **已定** SQLAlchemy 2.0 Core + PyMySQL | 只有 `store/` 依赖它；`core/` 与 `pipeline.py` 不碰 SQL |
-| 任务执行 | 待定 | 进程内后台任务起步，压力上来再换 worker |
+| 任务执行 | **已实现** 进程内线程池 | `GRADING_CONCURRENCY`（默认 2，上限 4）。重启时把 running 任务标为 interrupted 并可重试；多 worker 部署需换共享队列 |
 | 前端 | **已定** Vue 3 | 组件库待定；复核界面是必需项 |
 | 认证 | **已实现** 单口令 + 会话 cookie | 口令存 `ADMIN_PASSWORD`，缺失则启动失败；会话服务端登记，退出即可撤销。会话存内存（重启失效），多进程需换共享存储 |
 | 接口层 | **已开始** FastAPI | 目前只有认证与健康检查；导入/评分/复核接口在 #7 之后 |

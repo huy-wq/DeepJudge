@@ -6,9 +6,9 @@
 >
 > 若两者冲突，以 `docs/architecture.md` 为准；发现冲突请改本文件。
 
-**当前状态**：193 个测试通过（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
-裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归），约 9500 行（含文档与测试）。
-已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#10 标准生成。
+**当前状态**：218 个测试通过（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
+裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归），约 11000 行（含文档与测试）。
+已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#10 标准生成。
 **没有**的部分见 §8，别在代码里找不存在的东西。
 
 ---
@@ -40,12 +40,13 @@ backend/
 │   ├── store/           ← 持久化（唯一碰 SQL 的地方）
 │   ├── api/             ← HTTP 接口层：路由、认证/数据库依赖、错误映射
 │   ├── importing.py      ← 答卷导入解析（纯函数，不碰库与 HTTP）
+│   ├── tasks.py          ← 批量评分任务的线程池执行器
 │   ├── auth.py          ← 共享口令 + 服务端会话（可撤销、可过期）
 │   ├── main.py          ← FastAPI 装配（工厂函数，启动期校验口令）
 │   ├── cli.py           ← 命令行入口与报告组装
 │   └── config.py        ← .env 读取
 ├── migrations/          ← Alembic 迁移（表结构的部署真源）
-├── tests/               ← 193 个用例
+├── tests/               ← 218 个用例
 └── scripts/             ← 实验脚本（backend/scripts，如方差实测）
 
 仓库根目录还有：docker-compose.yml（本地 MySQL 8）、scripts/dev-db.sh（一键起库 + 迁移）。
@@ -65,6 +66,7 @@ backend/
 | `cli.py` | 206 | 全部 | ⑨ |
 | `auth.py` + `api/` + `main.py` | 约 400 | FastAPI | ⑩（另一条主线：HTTP 入口） |
 | `importing.py` | 260 | 仅标准库 + core | ⑪（答卷怎么进来） |
+| `tasks.py` | 190 | core + providers + store | ⑫（怎么批量评） |
 
 **依赖方向是硬约束，不是风格建议。** 可以用一条命令自己验：
 
@@ -554,7 +556,7 @@ PY
 
 **职责**：一次评分的全部数据落库，并按答卷号或运行号读回**领域对象本身**。
 
-读的顺序：`tables.py`（8 张表，先看结构）→ `repository.py:162` `save_evaluation` → `:331` `load_evaluation`。
+读的顺序：`tables.py`（10 张表，先看结构）→ `repository.py` 的 `save_evaluation` → `load_evaluation`。
 
 **`tables.py` 里值得单独看的几处**：
 
@@ -719,6 +721,53 @@ curl -s -b /tmp/c.txt -X POST localhost:8000/api/answers/preview \
 **读完要能回答**：为什么"取消导入不产生任何数据"这条验收几乎没有实现成本？
 （因为预览和入库是两条独立的路由，前端不点确认就不会调 import。）
 
+### ⑫ 怎么批量评：`app/tasks.py` + `app/api/tasks.py`（约 25 分钟）
+
+**职责**：把"一堆答卷 × 一份标准"跑成一批结果，并且**一份失败不拖垮整批**。
+
+这一层的难点不在评分（评分已经在 `pipeline.py` 里了），而在**并发下的状态管理**。
+
+| 位置 | 在干什么 | 读的时候注意 |
+| --- | --- | --- |
+| `app/tasks.py:40` `TaskRunner` | 一个 Store + 一个 provider 工厂 | provider 用工厂：假 provider 的游标不该跨答卷复用 |
+| `:96` `_process` | 起 N 个 worker，各自循环领取 | 不是"一次抢光再提交"——`running` 才真的代表"正在评" |
+| `:116` `_grade_one` | 评一份：取答卷 → 取标准快照 → `evaluate` → 落库 | 所有异常都在这层被吃成 `failed`，绝不冒泡 |
+| `:83` `_run` | 任务级收尾 | **必须有 except**：执行器自己崩了也要把任务标成 `interrupted` 并记原因，否则它永远停在 running |
+| `app/store/repository.py:819` `claim_next_item` | **CAS** 领取：带 `status='pending'` 条件更新 | 先读后写会有一份答卷被评两次（本票踩过） |
+| `repository.py:692` `create_task` | 建任务 + 固定 `rubric_id` | 任务级快照：之后改标准不影响这批 |
+| `repository.py:895` `task_item_views` | 进度查询（含分数与 `route`） | "待复核"由 `route` 派生，不另存 |
+| `repository.py:977` `mark_interrupted_tasks` | 启动时清理上次的 running | 没有它，崩溃后任务永远显示"进行中" |
+| `app/api/tasks.py:54` `POST /api/tasks` | 建任务并 `runner.start` | 参数校验：答卷必须属于该题 |
+| `:75` `POST /api/tasks/{id}/retry` | 只把失败项放回 pending | 可传 `answer_ids` 只重试指定几份 |
+
+**一处必须看懂的并发细节**：
+
+```python
+# claim_next_item 的核心：读候选 → 带条件更新 → 看 rowcount
+claimed = conn.execute(
+    task_items.update()
+    .where(task_items.c.id == row[0], task_items.c.status == "pending")
+    .values(status="running")
+).rowcount
+if claimed == 1:
+    return ...      # 抢到了
+# rowcount == 0：别人先抢走了，回到循环取下一行
+```
+
+单进程里加把锁也能解决，但 CAS 在 MySQL 多进程部署时同样成立——
+这就是为什么不用 `threading.Lock` 糊过去。
+
+**动手验证**（假 provider，不联网；离线也能看到"失败隔离"）：
+
+```bash
+cd backend
+python3 -m unittest tests.test_tasks -v          # 11 个用例，含并发与重启
+python3 -m unittest tests.test_api_tasks -v      # 9 个用例，HTTP 层
+```
+
+**读完要能回答**：任务"跑完了但有失败项"，状态应该是 `done` 还是 `failed`？
+（`done`。状态在每一项上；把任务标成 failed 会掩盖"大部分已经评完"这个事实。）
+
 ---
 
 ## 3. 三条主线追踪
@@ -784,6 +833,8 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 | `test_gen_rubric_script.py` | 6 | 生成脚本的退出码（含模型调用失败）与三视图输出；保存的标准能直接喂给评分 |
 | `test_cli.py` | 5 | 报告字段齐全；错误码；`--save` 能读回 |
 | `test_store.py` | 17 | 字段无损往返；标准快照不可变；重评后按旧运行号不会串到新结论；导入与查重 |
+| `test_tasks.py` | 14 | 并发领取不重复、单份失败隔离、快照固定、失败项可单独重试、重启标中断、**执行器崩溃后任务可重试** |
+| `test_api_tasks.py` | 11 | 建任务/查进度/重试；派生状态 `state`；重复 id 去重；跨题 id 400；未登录 401 |
 | `test_migrations.py` | 2 | 迁移建出的表 == `tables.py`（逐列、逐索引、逐外键） |
 | `test_store_mysql.py` | 3 | 真库 `utf8mb4`；中文与 emoji 在 TEXT 与 **JSON 列**都能存活（默认跳过） |
 | `test_importing.py` | 25 | 两种来源、表头（含空列不错位）、列数、坏行、BOM/CRLF、引号内换行、**坏行不回显学号** |
@@ -828,6 +879,12 @@ DATABASE_URL="sqlite:////tmp/dj.db" ADMIN_PASSWORD=devpass \
 
 # 起 HTTP 服务（不需要数据库；没有 ADMIN_PASSWORD 会直接失败）
 cd backend && ADMIN_PASSWORD=devpass python3 -m uvicorn app.main:create_app --factory --port 8000
+
+# 批量评分：建任务 → 轮询进度 → 只重试失败项
+curl -s -b /tmp/c.txt -X POST localhost:8000/api/tasks -H 'content-type: application/json' \
+  -d '{"question_code":"Q-01","answer_ids":[2,3],"samples":1}'
+curl -s -b /tmp/c.txt localhost:8000/api/tasks/1
+curl -s -b /tmp/c.txt -X POST localhost:8000/api/tasks/1/retry -H 'content-type: application/json' -d '{"answer_ids":[]}'
 
 # 从教师原话生成结构化标准（离线；加 --live 则真调模型）
 cd backend
@@ -889,9 +946,8 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 
 | 缺什么 | 属于哪张工单 | 现状 |
 | --- | --- | --- |
-| 评分/复核接口 | #8、#9 | `app/api/` 目前只有认证、健康检查、答卷导入与答卷列表 |
+| 复核接口与页面 | #9 | `reviews` 表已建但无读写代码；`app/api/` 目前有认证、导入、任务 |
 | 导入批次撤销 | 未定 | 只能按 answer_id 删；验收只要求"取消导入不产生数据"，已满足 |
-| 后台批量评分任务 | #8 | 没有，`evaluate` 是同步的 |
 | 复核界面与人工改分 | #9 | 只有 `reviews` 表，没有读写它的代码 |
 | 自然语言 → 标准（HTTP 接口） | #13 | 生成逻辑已在 `app/rubric_gen.py`，但只有脚本入口，没有 REST |
 | 分数校准 | 校准层 | `core/calibrate.py` **不存在**；`calibrated_score` 恒为 `NULL` |

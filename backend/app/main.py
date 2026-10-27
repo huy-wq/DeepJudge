@@ -13,14 +13,19 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from typing import Callable
 
 from fastapi import FastAPI
 
 from .api import errors
 from .api import register as register_auth
 from .api.answers import register as register_answers
+from .api.tasks import register as register_tasks
 from .auth import SESSION_TTL_SECONDS, AdminAuth
+from .providers.base import GradingProvider, ProviderError
+from .providers.deepseek import DeepSeekConfig, DeepSeekProvider
 from .store import Store
+from .tasks import TaskRunner, concurrency_from_env
 
 DEFAULT_SESSION_HOURS = SESSION_TTL_SECONDS // 3600
 
@@ -45,11 +50,16 @@ def session_hours_from_env() -> int:
     return hours
 
 
-def create_app(*, auth: AdminAuth | None = None) -> FastAPI:
+def create_app(
+    *,
+    auth: AdminAuth | None = None,
+    provider_factory: Callable[[], GradingProvider] | None = None,
+) -> FastAPI:
     """装配 FastAPI 应用。
 
     传入 `auth` 时完全按传入的来（测试用假时钟）；
     否则从环境变量取 `ADMIN_PASSWORD`，没有就直接报错。
+    `provider_factory` 让测试塞假 provider；不传就用 DeepSeek。
     """
     if auth is None:
         password = (os.environ.get("ADMIN_PASSWORD") or "").strip()
@@ -62,9 +72,13 @@ def create_app(*, auth: AdminAuth | None = None) -> FastAPI:
         auth = AdminAuth(password, ttl_seconds=session_hours_from_env() * 3600)
 
     store = _store_from_env()
+    factory = provider_factory or _default_provider
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        if app.state.store is not None:
+            # 上次进程死在跑任务上时，别让任务永远显示"进行中"
+            app.state.store.mark_interrupted_tasks()
         yield
         if app.state.store is not None:
             app.state.store.dispose()
@@ -72,11 +86,22 @@ def create_app(*, auth: AdminAuth | None = None) -> FastAPI:
     app = FastAPI(title="DeepJudge", version="0.1.0", lifespan=lifespan)
     app.state.auth = auth
     app.state.store = store
+    app.state.runner = (
+        TaskRunner(store, factory, concurrency=concurrency_from_env()) if store else None
+    )
 
     errors.register(app)
     register_auth(app, auth, secure_cookie=_env_flag("COOKIE_SECURE"))
     register_answers(app)
+    register_tasks(app)
     return app
+
+
+def _default_provider() -> GradingProvider:
+    """默认用 DeepSeek。密钥缺失时抛 ProviderError，由任务记成单份失败而不是崩掉整批。"""
+    if not (os.environ.get("DEEPSEEK_API_KEY") or "").strip():
+        raise ProviderError("MISSING_API_KEY", "未配置 DEEPSEEK_API_KEY", retryable=False)
+    return DeepSeekProvider(DeepSeekConfig.from_env())
 
 
 def _store_from_env() -> Store | None:

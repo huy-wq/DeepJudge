@@ -95,6 +95,10 @@ class DeepSeekProvider:
         self.config = config
         self._transport = transport or _http_post
 
+    @property
+    def model_name(self) -> str:
+        return self.config.model
+
     def build_body(self, messages: list[dict]) -> dict:
         body: dict = {
             "model": self.config.model,

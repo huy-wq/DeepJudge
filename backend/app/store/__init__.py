@@ -14,6 +14,8 @@ from .repository import (
     RunRecord,
     Store,
     StoredEvaluation,
+    TaskItem,
+    TaskRecord,
 )
 from .tables import metadata
 
@@ -26,5 +28,7 @@ __all__ = [
     "RunRecord",
     "Store",
     "StoredEvaluation",
+    "TaskItem",
+    "TaskRecord",
     "metadata",
 ]

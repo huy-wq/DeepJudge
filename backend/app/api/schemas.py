@@ -33,3 +33,16 @@ class ImportConfirm(ImportRequest):
     skip_duplicates: bool = Field(
         default=True, description="同题号 + 相同内容视为重复，默认跳过"
     )
+
+
+# ---------------------------------------------------------------- 批量任务
+class CreateTaskRequest(BaseModel):
+    question_code: str = Field(description="题号，如 Q-01")
+    answer_ids: list[int] = Field(min_length=1, description="要评的答卷编号")
+    samples: int = Field(default=3, ge=1, le=5, description="每份答卷采样几次")
+
+
+class RetryRequest(BaseModel):
+    answer_ids: list[int] = Field(
+        default_factory=list, description="只重试这几份；空表示本任务全部失败项"
+    )

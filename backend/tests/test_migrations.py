@@ -82,6 +82,8 @@ class MigrationMatchesMetadata(unittest.TestCase):
         self.url = f"sqlite:///{Path(self.tempdir.name) / 'migrate.db'}"
         self.config = Config(str(BACKEND_DIR / "alembic.ini"))
         self.config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+        # 不打 alembic 的 INFO 日志：会把断言失败的信息挤掉
+        self.config.config_file_name = None
         # 让 env.py 读到的 URL 与这里一致；context 退出时自动恢复
         env = database_url(self.url)
         env.__enter__()
