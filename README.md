@@ -272,6 +272,23 @@ curl -s -b /tmp/c.txt -X POST http://127.0.0.1:8000/api/rubrics/1/iterate \
 
 保存只追加版本，旧版永远能按 id 打开；已经建好的评分任务仍指向它启动时那一版。
 
+**合成用例与对照实验**
+
+```bash
+cd backend
+# 只校验用例，不调模型、不写库
+python3 scripts/experiment.py check --rubric ../data/samples/tcp-handshake/rubric.json \
+    --cases ../data/samples/tcp-handshake/cases.json
+
+# 四组对照：B0 直接要总分 / B2 逐点 / B3 逐点+接地 / B5 采样+路由（真调模型，需要 --live）
+python3 scripts/experiment.py run --rubric ../data/samples/tcp-handshake/rubric.json \
+    --cases ../data/samples/tcp-handshake/cases.json --live --configs b0,b2,b3,b5 --samples 3
+```
+
+用例 = 答案 + 期望总分 + 每条采分点期望等级；每套标准至少要有一条 `correct=true` 的正确答案。
+输出通过率、MAE、QWK、接地率与自动通过率，并列出逐条失败明细。QWK 按 0.5 分档；
+样本不足或只有单一分数时显示 `—`（无定义），不写成 0。B5 **不含校准**，论文里不要写成完整 B5。
+
 **跑一次评分并把结果落库**
 
 ```bash
@@ -295,5 +312,5 @@ DEEPJUDGE_TEST_MYSQL_URL='mysql+pymysql://deepjudge:deepjudge@127.0.0.1:3307/dee
 # 连接账号需要有 CREATE DATABASE 权限，没有就自动 skip
 
 cd frontend
-npm run test                                            # 前端：登录守卫、会话、统一错误提示
+npm run test                                            # 前端：83 个用例，登录守卫/标准/导入/任务/复核
 ```

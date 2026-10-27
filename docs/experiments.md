@@ -42,3 +42,70 @@
 cd backend
 python3 scripts/probe_variance.py --rubric /tmp/rubric.json --answer /tmp/answer.txt --runs 5
 ```
+
+---
+
+## E2 · 合成用例与对照实验（工具就绪，尚未真跑）
+
+**要回答的问题**：与"一段提示词直接要总分"相比，逐点判定、证据接地、采样与路由各带来多少？
+这是论文里设计合理性的对照实验，不能用"看起来更合理"代替数据。
+
+**用例格式**（`data/samples/tcp-handshake/cases.json`）
+
+```json
+{
+  "question_code": "Q-01",
+  "cases": [
+    {
+      "id": "perfect",
+      "correct": true,
+      "answer": "客户端发送 SYN……",
+      "expected": { "total": 10, "items": { "P1": 1, "P2": 1, "P3": 1 } }
+    }
+  ]
+}
+```
+
+- `correct: true` 至少一条；它必须真的是满分（期望总分等于满分、各点等级取最高档）。
+- `items` 必须覆盖标准的**全部**采分点；等级必须是该点允许的取值。
+- `check` 不调模型；`run` 才发请求。
+
+**四组配置**
+
+| 组 | 实现 | 说明 |
+| --- | --- | --- |
+| B0 | 单独提示词，只解析 `{"total": ...}` | 朴素做法基线 |
+| B2 | 逐点提示词，`check_grounding=False` | 不校验证据；把判定视为全部采信，避免扣分项被误关 |
+| B3 | 逐点提示词 + 接地，采样 1 次 | 看接地拦住了多少编造 |
+| B5 | B3 + 采样 + 路由 | **不含校准**；论文里写"B5（不含校准）" |
+
+**指标**
+
+| 指标 | 定义 | 注意 |
+| --- | --- | --- |
+| 通过率 | 总分在 ±0.01 内，且（逐点配置）所有点等级一致 | 错误也算未通过，并进失败明细 |
+| MAE | 总分绝对误差均值 | 只统计成功产出预测的用例 |
+| QWK | 总分按 0.5 分档后的二次加权 kappa | 少于 2 条或只有单一分数时无定义，输出 `—` |
+| 逐点准确率 | 预测等级等于期望等级的采分点比例 | B0 没有逐点输出，输出 `—` |
+| 接地率 | 各用例 `grounding_rate` 的均值 | B2 不校验，输出 `—`；B0 没有逐点判定 |
+| 自动通过率 | `route=auto` 的比例 | 只有 B5 有路由；B0/B2/B3 输出 `—` |
+
+**复现**
+
+```bash
+cd backend
+python3 scripts/experiment.py check --rubric ../data/samples/tcp-handshake/rubric.json \
+    --cases ../data/samples/tcp-handshake/cases.json
+python3 scripts/experiment.py run --rubric ../data/samples/tcp-handshake/rubric.json \
+    --cases ../data/samples/tcp-handshake/cases.json --live --configs b0,b2,b3,b5 --samples 3
+```
+
+**状态**：脚本与用例已就绪，**本文件还没有 E2 的真实结果**。跑完后把设置、原始指标、
+失败明细与结论补在下面，不要只贴一行"效果更好"。
+
+**局限（写论文时必须带上）**
+
+- 合成用例的期望值由本课题作者标注，不是教师双评；没有 ICC 与人际一致性参照系。
+- 用例量小，QWK 的置信区间会很宽，不能据此断言"达到可用"。
+- B0 的提示词也拿到了完整 rubric；它衡量的是"不逐点输出、不校验证据"，不是"什么上下文都不给"。
+- B5 不含校准；"完整系统的上限"这句话在这一版不成立。

@@ -6,10 +6,10 @@
 >
 > 若两者冲突，以 `docs/architecture.md` 为准；发现冲突请改本文件。
 
-**当前状态**：317 个后端用例（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
+**当前状态**：334 个后端用例（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
 裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归）
 + 83 个前端用例（Vitest + jsdom，见 §2 ⑮/⑯/⑰/⑱），约 2.4 万行（含文档、测试与锁文件）。
-已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成、#11 标准保存与迭代、#12 前端骨架、#13 标准编辑页、#14 导入与任务页。
+已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成、#11 标准保存与迭代、#12 前端骨架、#13 标准编辑页、#14 导入与任务页、#15 复核页、#16 合成用例与对照实验。
 **没有**的部分见 §8，别在代码里找不存在的东西。
 
 ---
@@ -42,13 +42,14 @@ backend/
 │   ├── api/             ← HTTP 接口层：路由、认证/数据库依赖、错误映射
 │   ├── importing.py      ← 答卷导入解析（纯函数，不碰库与 HTTP）
 │   ├── tasks.py          ← 批量评分任务的线程池执行器
+│   ├── experiment.py     ← 编排：合成用例、四组对照配置与指标
 │   ├── auth.py          ← 共享口令 + 服务端会话（可撤销、可过期）
 │   ├── main.py          ← FastAPI 装配（工厂函数，启动期校验口令）
 │   ├── cli.py           ← 命令行入口与报告组装
 │   └── config.py        ← .env 读取
 ├── migrations/          ← Alembic 迁移（表结构的部署真源）
-├── tests/               ← 317 个用例
-└── scripts/             ← 实验脚本（backend/scripts，如方差实测）
+├── tests/               ← 334 个用例
+└── scripts/             ← experiment.py（check / run）、gen_rubric.py、probe_variance.py（方差实测）
 
 frontend/                ← 管理端（Vue 3 + Vite + TS + Element Plus）
 ├── src/api/             ← HTTP 客户端（统一错误）、认证、标准、答卷、任务、复核
@@ -1059,6 +1060,58 @@ npm run test -- tests/review-detail.test.ts  # 6 个用例：证据高亮、改�
 
 ---
 
+### ⑲ 合成用例与对照实验：`app/experiment.py` + `scripts/experiment.py`（约 30 分钟）
+
+**职责**：用"答案 + 期望总分 + 每条采分点期望等级"的用例回归评分行为；
+切换 B0/B2/B3/B5 四组配置，输出与朴素做法的对比指标。
+
+| 位置 | 在干什么 | 读的时候注意 |
+| --- | --- | --- |
+| `app/experiment.py:74` `config_for` | 四组配置的唯一出处 | B0 直接要总分；B2/B3 固定单采样；B5 才用 `--samples` |
+| `:140` `parse_case_set` | JSON → `CaseSet` | 结构错误直接抛；语义错误留给 `check_cases` |
+| `:203` `check_cases` | 纯校验，不调模型 | 题号、采分点 id、等级取值域、期望总分、至少一条正确答案 |
+| `:318` `grade_total` | B0 的"只要总分"提示词与解析 | 越界值会截断；缺 `total` 直接算失败，不猜 |
+| `:352` `run_config` | 逐条跑用例，产出预测与失败明细 | 一份用例失败不拖垮整组；错误也进明细 |
+| `:422` `_metrics` | 通过率、MAE、逐点准确率、接地率、自动通过率 | B0 的逐点/接地/路由指标是 `None`，不是 0 |
+| `:503` `quadratic_weighted_kappa` | 按 0.5 分档算 QWK | 少于 2 条或只有一个分数时无定义，返回 `None` |
+| `:550` `run_experiment` | 多组配置批量跑 | CLI 只做参数与格式化 |
+| `scripts/experiment.py` | `check` / `run` 两个子命令 | `run` 必须显式 `--live`，避免误花钱 |
+| `data/samples/tcp-handshake/cases.json` | 4 条示例用例 | 含一条 `correct=true` 的满分答案 |
+
+**四处必须看出的设计**：
+
+1. **`check` 不碰模型。**
+   校验只看用例与标准：题号是否一致（给了 `--database-url` 才查库）、采分点 id 是否存在、
+   期望等级是否在允许集合、期望总分是否越界、有没有正确答案用例。没有密钥也能跑。
+
+2. **B2 不校验证据，但把判定标成 grounded。**
+   否则扣分项永远不生效、置信度被接地率拉到 0，"B2 vs B3"的差异会混进别的变量。
+   指标里 B2 的接地率是 `None`——它根本没有校验，不该报一个假的 1.0 或 0.0。
+
+3. **B5 不是"完整 B5"。**
+   它包含采样与路由，但**校准尚未实现**；论文里要写"B5（不含校准）"，不能把缺失的部分算进上限。
+
+4. **QWK 无定义时返回 `None`，不返回 0。**
+   0 会被读成"完全不一致"；样本不足、只有单一分数时，正确的说法是"算不出来"。
+   分档用 0.5 分，是因为总分本身就是 0.5 的倍数。
+
+**动手验证**：
+
+```bash
+cd backend
+python3 scripts/experiment.py check --rubric ../data/samples/tcp-handshake/rubric.json \
+    --cases ../data/samples/tcp-handshake/cases.json        # 不调模型
+python3 scripts/experiment.py run --rubric ../data/samples/tcp-handshake/rubric.json \
+    --cases ../data/samples/tcp-handshake/cases.json --live --configs b0,b2,b3,b5
+python3 -m unittest tests.test_experiment -v                # 14 个用例
+python3 -m unittest tests.test_experiment_script -v         # 3 个入口用例
+```
+
+**读完要能回答**：为什么 B0 的 `auto_pass_rate` 是 `None` 而不是 0？
+（B0 只给总分，没有采样分歧、置信度与路由；把"没有这个指标"写成 0，会让人以为它全部转人工。）
+
+---
+
 ## 3. 三条主线追踪
 
 读完之后，用这三条主线检验自己是否真的串起来了。每条都给出"该看哪几个文件"。
@@ -1137,6 +1190,8 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 | `test_api_answers.py` | 19 | 预览不写库、按题号查重（跨题不误判、批内标重复）、未登录 401、无库 503、422 不回显内容 |
 | `test_auth.py` | 13 | 口令校验、会话过期（拨表不 sleep）、退出即撤销、口令为空拒绝启动 |
 | `test_api_auth.py` | 14 | 401 的三种来源、登录下发 cookie、错口令不透露原因、退出后重放旧 cookie 必须 401 |
+| `test_experiment.py` | 14 | 用例校验、至少一条正确答案、B0/B2/B3 差异、QWK/MAE/通过率/自动通过率 |
+| `test_experiment_script.py` | 3 | `check` 不调模型、无效用例退出码 2、`run` 必须显式 `--live` |
 
 **前端（Vitest + jsdom）**：`cd frontend && npm run test`
 
@@ -1277,6 +1332,7 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 | 改统一错误文案 | `frontend/src/feedback.ts` 或 `frontend/src/api/client.ts` 的兜底 | 各页面的模板 |
 | 改导入格式（如 Excel） | `app/importing.py` 加一个 `source` 分支 | `store/`、`api/` |
 | 换会话存储（Redis / 数据库） | 只换 `AdminAuth` 的登记表实现 | `api/`、`main.py` |
+| 加一组对照配置 | `app/experiment.py` 的 `CONFIG_KEYS` / `config_for` / `run_config` | `core/`、`pipeline.py` |
 | 加一种复核结论（如"退回重评"） | `store/repository.py` 的 `record_review` + `api/results.py` + `reviews.decision` 的取值 | `core/`、`pipeline.py` |
 | 加一种标准修改方式（如批量改权重） | `api/rubrics.py` 的 `_save` + `store.save_rubric` | `core/rubric.py` 的校验规则（除非真的要加新规则） |
 
@@ -1304,6 +1360,8 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 | 任务历史列表 | 未定 | 任务号只在当前 URL；关掉链接就找不到旧任务 |
 | 直接导入 `.xlsx` | 未定 | 页面只收 UTF-8 的 CSV/文本，Excel 需另存为 CSV |
 | token / 耗时统计 | 后续 | `grading_runs.tokens_in/latency_ms` 列存在但恒为 `NULL` |
+| ICC(2,1) 与教师一致性 | 需要双评数据 | 指标未实现；当前只报 QWK / MAE / 逐点准确率 |
+| 对照组的真实结果 | 答辩前 | 脚本已就绪；`docs/experiments.md` 目前只有 E1，B0–B5 还没真跑 |
 
 ---
 

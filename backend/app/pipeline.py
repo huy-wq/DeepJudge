@@ -91,7 +91,13 @@ def grade(
     provider: GradingProvider,
     *,
     sample_index: int = 0,
+    check_grounding: bool = True,
 ) -> SampleJudgement:
+    """跑一次评分。`check_grounding=False` 只给对照实验的 B2 用。
+
+    不校验证据时把判定全部标成 grounded：否则扣分项永远不生效、
+    置信度被接地率拉到 0，B2 与 B3 的差异就混进了别的变量。
+    """
     raw = provider.complete(build_messages(rubric, answer), sample_index=sample_index)
     try:
         payload = extract_payload(raw)
@@ -101,7 +107,13 @@ def grade(
 
     items = _parse_items(rubric, payload)
     deductions = _parse_deductions(rubric, payload)
-    apply_grounding(items, deductions, answer)
+    if check_grounding:
+        apply_grounding(items, deductions, answer)
+    else:
+        for judgement in items:
+            judgement.grounded = True
+        for judgement in deductions:
+            judgement.grounded = True
 
     sample = SampleJudgement(
         question_id=rubric.question_id,
@@ -128,13 +140,24 @@ def evaluate(
     *,
     samples: int = 3,
     policy: RoutePolicy | None = None,
+    check_grounding: bool = True,
 ) -> Evaluation:
-    """采样若干次后聚合，并给出自动通过 / 转人工的结论。"""
+    """采样若干次后聚合，并给出自动通过 / 转人工的结论。
+
+    `check_grounding=False` 只给对照实验的 B2 用；正常评分永远走默认值。
+    """
     if samples < 1:
         raise ValueError("采样次数至少为 1")
 
     results = [
-        grade(rubric, answer, provider, sample_index=index) for index in range(samples)
+        grade(
+            rubric,
+            answer,
+            provider,
+            sample_index=index,
+            check_grounding=check_grounding,
+        )
+        for index in range(samples)
     ]
     combined = aggregate(rubric, results)
     decision = decide(combined, policy)

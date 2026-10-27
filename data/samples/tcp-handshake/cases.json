@@ -1,0 +1,38 @@
+{
+  "question_code": "Q-01",
+  "cases": [
+    {
+      "id": "perfect",
+      "correct": true,
+      "answer": "客户端首先发送 SYN 报文，seq=x，请求建立连接；服务器回复 SYN=1、ACK=1，seq=y，ack=x+1；客户端再发送 ACK=1，seq=x+1，ack=y+1。三次握手用于同步双方初始序列号，并确认双方的收发能力。",
+      "expected": {
+        "total": 10,
+        "items": { "P1": 1, "P2": 1, "P3": 1 }
+      }
+    },
+    {
+      "id": "missing-last-ack",
+      "answer": "客户端发送 SYN，seq=x；服务器回复 SYN+ACK，seq=y，ack=x+1；然后双方就开始传数据了。",
+      "expected": {
+        "total": 7,
+        "items": { "P1": 1, "P2": 1, "P3": 0 }
+      }
+    },
+    {
+      "id": "vague",
+      "answer": "客户端先发一个请求，服务器同意之后连接就建立起来了。",
+      "expected": {
+        "total": 3.5,
+        "items": { "P1": 0.5, "P2": 0.5, "P3": 0 }
+      }
+    },
+    {
+      "id": "confused-with-teardown",
+      "answer": "三次握手其实和四次挥手一样，都是先发 FIN，再回 ACK，最后双方各发一次确认。",
+      "expected": {
+        "total": 0,
+        "items": { "P1": 0, "P2": 0, "P3": 0 }
+      }
+    }
+  ]
+}
