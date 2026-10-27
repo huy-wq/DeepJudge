@@ -6,9 +6,10 @@
 >
 > 若两者冲突，以 `docs/architecture.md` 为准；发现冲突请改本文件。
 
-**当前状态**：309 个测试通过（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
-裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归），约 12000 行（含文档与测试）。
-已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成、#11 标准保存与迭代。
+**当前状态**：309 个后端用例（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
+裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归）
++ 33 个前端用例（Vitest + jsdom，见 §2 ⑮），约 13000 行（含文档与测试）。
+已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#7 答卷导入、#8 批量任务、#9 复核与改分、#10 标准生成、#11 标准保存与迭代、#12 前端骨架。
 **没有**的部分见 §8，别在代码里找不存在的东西。
 
 ---
@@ -49,6 +50,17 @@ backend/
 ├── tests/               ← 309 个用例
 └── scripts/             ← 实验脚本（backend/scripts，如方差实测）
 
+frontend/                ← 管理端骨架（Vue 3 + Vite + TS + Element Plus）
+├── src/api/             ← HTTP 客户端（统一错误）与认证接口
+├── src/router/          ← 路由与登录守卫
+├── src/session.ts       ← 登录态：服务端 cookie + 一次 /session 确认
+├── src/feedback.ts      ← 统一错误提示（ElMessage）
+├── src/components/      ← ErrorBoundary（渲染错误不白屏）
+├── src/layouts/         ← AdminLayout
+├── src/views/           ← 登录 / 首页 / 404
+├── tests/               ← 33 个用例（Vitest + jsdom）
+└── vite.config.ts       ← dev proxy /api → :8000；Vitest 配置
+
 仓库根目录还有：docker-compose.yml（本地 MySQL 8）、scripts/dev-db.sh（一键起库 + 迁移）。
 ```
 
@@ -69,6 +81,10 @@ backend/
 | `tasks.py` | 190 | core + providers + store | ⑫（怎么批量评） |
 | `api/results.py` | 264 | FastAPI + store | ⑬（复核队列与定稿） |
 | `api/rubrics.py` | 189 | FastAPI + store + rubric_gen | ⑭（标准的保存与迭代） |
+| `frontend/src/api/` | 约 160 | 浏览器 `fetch` | ⑮（前端骨架） |
+| `frontend/src/session.ts` + `router/` | 约 160 | vue + vue-router | ⑮ |
+| `frontend/src/feedback.ts` + `components/` | 约 70 | Element Plus | ⑮ |
+| `frontend/src/views/` + `layouts/` | 约 240 | 以上 | ⑮ |
 
 **依赖方向是硬约束，不是风格建议。** 可以用一条命令自己验：
 
@@ -861,6 +877,51 @@ python3 -m unittest tests.test_api_rubrics -v    # 20 个用例：生成 → 保
 
 ---
 
+### ⑮ 前端骨架：`frontend/`（约 30 分钟）
+
+**职责**：登录、路由、把错误说清楚。业务页（标准编辑、导入、评分、复核）留到 #13–#15。
+
+| 位置 | 在干什么 | 读的时候注意 |
+| --- | --- | --- |
+| `src/api/client.ts` | `fetch` 封装：统一 `ApiError`、401、网络错误 | 后端 `{detail, code}` 在这里变成一句可读中文；没有 detail 也有兜底。401 会立刻触发路由层回登录页 |
+| `src/api/auth.ts` | 登录 / 退出 / 会话三个调用 | 只发相对路径 `/api/...`，开发期由 Vite 代理 |
+| `src/session.ts` | 登录态：`unknown` → `/api/auth/session` → 已登录/未登录 | **不在 localStorage 存 token**；刷新后仍登录靠的是 HttpOnly cookie |
+| `src/router/index.ts` | 路由表 + 全局守卫 + `onError` 回退 | 所有非 public 路由（包括 404）都先确认登录态；chunk 加载失败进 `/load-error`（这个页面在主包里） |
+| `src/feedback.ts` | 统一错误文案与全局提示，可替换 notifier | 登录失败贴在表单旁（不重复弹 toast）；其余错误走全局提示 |
+| `src/components/ErrorBoundary.vue` | 渲染期兜底 | 管理页用内层边界（只换内容区，导航还在）；登录页用外层边界 |
+| `src/layouts/AdminLayout.vue` | 顶栏 + 退出 + 内层 ErrorBoundary | 退出失败时**不**假装已退出；退出请求 401 时由 401 处理送回登录页 |
+| `src/views/LoginView.vue` | 口令表单 | 失败时同时给行内错误与全局提示；空口令不发请求 |
+| `vite.config.ts` | dev proxy 与 Vitest 配置 | `/api` → `127.0.0.1:8000`，同源才有 cookie |
+
+**一次刷新的完整链路**：
+
+```text
+打开 /            → 守卫 ensureSession()
+                  → GET /api/auth/session（带 cookie）
+                  → 200 {authenticated:true} → 放行
+                  → 401 → /login?redirect=/
+登录              → POST /api/auth/login（204 + Set-Cookie）
+                  → session.status = authenticated → 跳首页
+任一接口 401      → client 清本地态 → 路由层立刻 replace 到 /login（不等下一次导航）
+懒加载失败        → router.onError → /load-error（主包页面，提示刷新）
+退出              → POST /api/auth/logout（撤销服务端会话）→ 清本地态 → /login
+```
+
+**动手验证**：
+
+```bash
+cd frontend
+npm install
+npm run test        # 33 个用例：守卫、会话、统一错误、退出、ErrorBoundary
+npm run typecheck
+npm run build
+```
+
+**读完要能回答**：为什么刷新页面后还保持登录，而不是"前端把登录态存在了哪里"？
+（存在服务端；cookie 是 HttpOnly 的，前端只负责带着它去问 `/api/auth/session`。）
+
+---
+
 ## 3. 三条主线追踪
 
 读完之后，用这三条主线检验自己是否真的串起来了。每条都给出"该看哪几个文件"。
@@ -940,6 +1001,17 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 | `test_auth.py` | 13 | 口令校验、会话过期（拨表不 sleep）、退出即撤销、口令为空拒绝启动 |
 | `test_api_auth.py` | 14 | 401 的三种来源、登录下发 cookie、错口令不透露原因、退出后重放旧 cookie 必须 401 |
 
+**前端（Vitest + jsdom）**：`cd frontend && npm run test`
+
+| 测试文件 | 用例数 | 守的性质 |
+| --- | --- | --- |
+| `tests/client.test.ts` | 6 | detail 原样透出、5xx 中文兜底、网络错误、401 通知会话层 |
+| `tests/session.test.ts` | 9 | 只确认一次、未登录不报错、响应格式校验、真实 401 接线、退出失败不假装退出 |
+| `tests/router.test.ts` | 9 | 未登录（含未知路径）跳登录、已登录访问登录页回首页、页面内 401 立刻回登录页、chunk 失败进回退页 |
+| `tests/login.test.ts` | 4 | 登录成功进首页、口令错误只贴表单不重复弹窗、空口令不发请求 |
+| `tests/layout.test.ts` | 4 | 退出回登录页、退出 401 也回登录页、错误卡只换内容区、退出失败留在管理端 |
+| `tests/error-boundary.test.ts` | 1 | 子组件抛错显示错误卡片，不白屏 |
+
 **测试里的接缝（seam）**，读懂这三个就够了：
 
 1. **纯函数直接单测**：`core/*` 没有依赖，想怎么测怎么测。
@@ -956,6 +1028,13 @@ cd backend && python3 -m unittest discover -s tests -t .
 
 # 只跑某一层
 python3 -m unittest tests.test_aggregate -v
+
+# 前端：开发服务器、测试、类型检查、构建
+cd frontend
+npm run dev          # http://127.0.0.1:5173（/api 代理到 :8000）
+npm run test
+npm run typecheck
+npm run build
 
 # 本地起库 + 建表（一条命令，可重复执行）
 ./scripts/dev-db.sh up
@@ -1050,6 +1129,8 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 | 加一种采分点类型 | `core/types.py` + `core/rubric.py` 的校验 + 迁移 | `cli.py` |
 | 加字段落库 | `store/tables.py` + 新迁移 + `save/load` | 其它层 |
 | 加 HTTP 接口 | `app/api/*.py` 里加 `register(app)`，受保护接口挂 `Depends(require_admin)`，要库的挂 `Depends(require_store)` | `core/`、`auth.py` |
+| 加一个管理端页面 | `frontend/src/views/` 新建组件 + `router/index.ts` 挂到管理布局下 + `frontend/src/api/` 加对应请求 | `frontend/src/api/client.ts`（除非要改错误形状） |
+| 改统一错误文案 | `frontend/src/feedback.ts` 或 `frontend/src/api/client.ts` 的兜底 | 各页面的模板 |
 | 改导入格式（如 Excel） | `app/importing.py` 加一个 `source` 分支 | `store/`、`api/` |
 | 换会话存储（Redis / 数据库） | 只换 `AdminAuth` 的登记表实现 | `api/`、`main.py` |
 | 加一种复核结论（如"退回重评"） | `store/repository.py` 的 `record_review` + `api/results.py` + `reviews.decision` 的取值 | `core/`、`pipeline.py` |
@@ -1076,7 +1157,7 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 | 导入批次撤销 | 未定 | 只能按 answer_id 删；验收只要求"取消导入不产生数据"，已满足 |
 | 分数校准 | 校准层 | `core/calibrate.py` **不存在**；`calibrated_score` 恒为 `NULL` |
 | 模型能力注册表 | 后续 | `providers/registry.py` **不存在** |
-| 前端 | #12–#15 | `frontend/` 目录不存在 |
+| 标准编辑页 / 导入与任务页 / 复核页 | #13–#15 | 骨架已在 `frontend/`，业务页未接 |
 | token / 耗时统计 | 后续 | `grading_runs.tokens_in/latency_ms` 列存在但恒为 `NULL` |
 
 ---

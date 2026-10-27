@@ -42,7 +42,7 @@ DeepJudge/
 │   └── tests/           # 单测与真库验证
 ├── scripts/dev-db.sh    # 本地数据库一键起库 + 升级表结构
 ├── docker-compose.yml   # 本地 MySQL 8（utf8mb4）
-├── frontend/            # 复核界面（选型待定，目录待创建）
+├── frontend/            # 管理端（Vue 3 + Vite + TypeScript + Element Plus，见 #12）
 └── data/                # 本地答卷与标注集，默认不入库
 ```
 
@@ -56,7 +56,8 @@ DeepJudge/
 | 存储 | MySQL 8（`utf8mb4`）+ Alembic 迁移 | **已实现** |
 | 认证 | 共享口令 + 服务端会话 cookie | **已实现** |
 | 任务执行 | 进程内后台任务 / 独立 worker | 待定 |
-| 前端 | Vue 3 | **已定**（组件库待定） |
+| 前端 | Vue 3 + Vite + TypeScript + Element Plus | **已实现骨架**（#12） |
+| 前端测试 | Vitest + @vue/test-utils（jsdom） | **已接入** |
 | LLM 供应商与参数 | DeepSeek（`providers/deepseek.py`，标准库实现） | **已接入** |
 | 部署 | 本地优先 | 待定 |
 
@@ -110,6 +111,30 @@ curl -s -c /tmp/c.txt -X POST http://127.0.0.1:8000/api/auth/login \
      -H 'content-type: application/json' -d '{"password":"换个只有你知道的口令"}'        # 204
 curl -s -b /tmp/c.txt http://127.0.0.1:8000/api/auth/session                            # 200
 ```
+
+**起前端（管理端骨架）**
+
+```bash
+cd frontend
+npm install            # 首次
+npm run dev            # http://127.0.0.1:5173
+```
+
+开发服务器把 `/api` 代理到 `http://127.0.0.1:8000`，所以前后端同源、cookie 能正常带上。
+先按上一节把后端跑起来（`ADMIN_PASSWORD=...`），打开 5173 会看到登录页：
+
+- 未登录访问任意管理路径 → 跳转登录页，并记住原地址；
+- 口令正确 → 进入首页；刷新页面会重新确认服务端 cookie，登录态保持；
+- 退出 → 回到登录页，服务端会话同时撤销；
+- 接口失败/后端没起 → 弹出可读提示，页面不会白屏（渲染异常也由 `ErrorBoundary` 兜住）。
+
+```bash
+npm run test        # Vitest（33 个用例，不需要浏览器）
+npm run typecheck   # vue-tsc
+npm run build       # 类型检查 + 生产构建
+```
+
+生产部署是后续工单：目前 `dist/` 需要由静态服务器托管，并保证 `/api` 反向代理到同一后端。
 
 **导入一个班的答卷（先预览、再入库）**
 
@@ -245,4 +270,7 @@ DEEPJUDGE_TEST_MYSQL_URL='mysql+pymysql://deepjudge:deepjudge@127.0.0.1:3307/dee
   python3 -m unittest tests.test_store_mysql             # MySQL 真库：字符集与 emoji
 # 该用例每次新建 deepjudge_test_<随机> 临时库、跑完删掉，不会动你给的库里的数据；
 # 连接账号需要有 CREATE DATABASE 权限，没有就自动 skip
+
+cd frontend
+npm run test                                            # 前端：登录守卫、会话、统一错误提示
 ```

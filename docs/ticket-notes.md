@@ -621,3 +621,72 @@ python3 -m app.cli --rubric r.json --answer a.txt --live
 - 保存是否要记录操作者。与 #9 同因：单口令系统无法区分人。
 - "内容相同就复用"时，新的 `feedback` 要不要单独存一条审计记录。现在只在原值为空时补写，非空则丢弃。
 - 原话是否允许事后改写。现在只补空值、不覆盖；如果要支持"更正原话"，需要明确它算不算一次版本变更。
+
+---
+
+## #12 前端骨架（2026-10-28）
+
+### 一、骨架的目标不是"好看"，是"不白屏、不迷路"
+
+三件事先立住：**未登录去哪、刷新还算不算登录、接口挂了看到什么**。
+页面本身只有登录、首页、404 三个，业务页留给 #13–#15。
+
+登录态的关键选择：**前端不存 token，也不在 localStorage 里记"已登录"**。
+唯一可信的是服务端会话；刷新时重放 `GET /api/auth/session`，带着 HttpOnly cookie 去问一次。
+这样"退出后受保护页不可访问"不是靠前端删一个标记，而是服务端会话真的没了。
+
+### 二、发现并修掉的问题（实现期）
+
+| 问题 | 现象与原因 | 处理 | 教训 |
+| --- | --- | --- | --- |
+| 用 setup 抛错测 ErrorBoundary | 子组件 `setup` 抛错时 Vue 只报"缺少 render"，错误卡片不出现 | 改成在 `render()` 里抛错；并 `await nextTick()` 再断言 | 测兜底逻辑要制造"渲染期"错误，且给 Vue 一次 re-render 的机会 |
+| jsdom 缺浏览器 API | Element Plus 部分组件依赖 `matchMedia` / `ResizeObserver`，测试环境没有 | `tests/setup.ts` 里补桩 | 组件库的测试环境不是浏览器，缺的 API 要显式补 |
+| 依赖版本跨了大版本 | registry 上 `vue-router` 已是 5、TypeScript 7、Vite 8、Vitest 5 | 固定在成熟线：vue-router 4.6 / TS 5.9 / Vite 7 / Vitest 3 | 骨架阶段优先稳定与可查资料，不追最新大版本 |
+| 全量引入 Element Plus | 构建产物 1MB，Vite 警告 chunk > 500KB | 骨架阶段接受；按需引入留给业务页稳定后再做 | 先跑通再优化，但要把代价写下来 |
+
+### 三、审查抓出来的问题（都已修）
+
+| 问题 | 现象与原因 | 处理 | 教训 |
+| --- | --- | --- | --- |
+| 401 只清状态、不跳转 | `markUnauthenticated` 清了本地态，但守卫只在"下一次导航"才跑；页面内请求 401 时教师停在一个空壳上 | 会话层加"401 导航回调"，路由模块注册 `replace` 到登录页；补"页面内 401 立刻回登录页"用例 | "清状态"和"离开当前页"是两件事，缺一件就等于没处理 |
+| 登录错误弹两次 | `notifyError` 弹 toast，返回值又塞进 `el-alert`，同一句话出现两遍 | 登录失败只贴表单（用同一个 `errorMessage` 映射），全局 toast 留给页面级错误；测试断言不弹 toast | "统一文案"不等于"统一呈现"；表单错误贴字段旁边更合适 |
+| ErrorBoundary 把导航也替换了 | 边界包在 `App.vue` 的 `router-view` 外，一旦渲染出错，顶栏与退出按钮一起消失，教师没法换页面 | 管理页用 `AdminLayout` 内层边界（`:key="route.fullPath"`，换页即重置），外层只兜登录页；测试断言错误卡出现时退出按钮仍在 | 兜底的范围要和"希望保留什么"对齐 |
+| 懒加载失败是纯白屏 | chunk 404/断网发生在路由层，不经过组件生命周期，`ErrorBoundary` 与 `errorHandler` 都接不到 | `router.onError` → `notifyError` + replace 到 `/load-error`；该页面在主包里（不走懒加载） | 兜底页自己不能也依赖懒加载 |
+| 会话响应缺字段时崩在 `undefined` | `request<T>` 只是类型断言；后端 200 给了空对象时 `info.authenticated` 抛 TypeError | `fetchSession` 校验 `authenticated` 是布尔，否则抛可读的 `BAD_SESSION_RESPONSE` | 类型断言在运行时什么也不保证；关键响应要验形状 |
+| 守卫的错误被降级成通用文案 | `consumeSessionError()` 返回字符串，`errorMessage` 只认 `ApiError`/`Error`，于是显示"操作失败，请稍后重试" | `errorMessage` 增加字符串分支；补路由守卫用例 | 同一个"错误"在不同层可能是 `Error`、`ApiError` 或字符串，映射要覆盖 |
+| 退出遇 401 仍停在管理端壳里 | client 已清状态，但 `AdminLayout` catch 只提示不导航 | 由 401 导航回调统一送回登录页；补"退出 401 也回登录页"用例 | 状态失效后的导航要集中处理，不能每个调用点各写一遍 |
+| 401 接线是测试盲点 | client 测试换的是 spy handler，session 测试直接调 `markUnauthenticated`，删掉真实接线测试仍然全绿 | 增加"真实 `request` → 会话变 anonymous"用例 | 被替换掉的接缝本身也要有测试 |
+| `meta.public` 没有类型 | 写错成 `pubic` 时 vue-tsc 发现不了，`/login` 会被当受保护页，形成重定向循环 | `declare module 'vue-router'` 扩展 `RouteMeta` | 路由元数据也是契约，值得让编译器检查 |
+| 测试里真实 `ElMessage` 堆 DOM | 未捕获的错误提示会在 `document.body` 留下 toast 与定时器，污染后续用例 | `tests/setup.ts` 每个用例前装空 notifier；需要断言的用例自行替换 | 测试默认应安静，只有关心提示的用例才打开它 |
+| `expiresAt` 写了没人读 | 会话模块存了过期时间，但页面从没用过 | 删除该字段，只保留服务端返回的 `expires_at`（类型层面） | 状态里每个字段都要有人读，否则就是在猜未来需求 |
+| `messageOf` 与 `errorMessage` 重复 | 两处各写一遍 `ApiError`/兜底映射 | 合并到 `api/client.ts` 的 `errorMessage`，`feedback` 直接复用 | 同一映射分两处，文案迟早不一致 |
+
+### 四、有意保留的判断
+
+| 争议点 | 说明 |
+| --- | --- |
+| 不引入 Pinia | 现在只有一份会话状态，一个 `session.ts` 模块足够；多一层状态库只会多一套约定 |
+| 不在 localStorage 存任何登录标记 | 标记可以被手工改成"已登录"，而服务端不认；以 `/api/auth/session` 为唯一真相 |
+| 404 也要求登录 | 未登录时连"这个路径不存在"都不该泄露；未知路径先过守卫 |
+| 退出失败时不假装退出 | 服务端会话可能还在，cookie 也还在；清本地态只会造成"看起来退了"的错觉 |
+| 错误文案只有一个映射 | `ApiError` + `errorMessage`；登录失败贴表单，其余错误走全局提示，不重复弹同一句 |
+| 401 立即回登录页 | 清状态与导航一起做；不依赖"下一次导航" |
+| 两级 ErrorBoundary | 管理页内层（保留导航），登录页外层；内层随路由 remount 重置 |
+| `/load-error` 放在主包 | 兜底页不能自己依赖懒加载 |
+| ErrorBoundary 返回 `false` | 捕获后不再向上冒泡，导航栏还在，教师可以换页面而不是整页空白 |
+| 开发期依赖 Vite 代理 | `/api` 同源才有 cookie；生产部署必须让静态站点与接口同源（反代），这一条写进架构 §5.9 |
+
+### 五、遗留
+
+- 生产部署未做：`npm run build` 的 `dist/` 需要静态服务器托管，并把 `/api` 反代到后端；没有 Nginx 配置或 FastAPI 静态托管方案。
+- 只做了桌面宽度，没有移动端适配与无障碍检查。
+- 全量引入 Element Plus，首屏包约 1MB（gzip 342KB）；按需引入/分包留待业务页稳定后处理。
+- 没有浏览器端到端测试（Playwright）；当前用 Vitest + jsdom 测行为，不测真实浏览器行为（cookie、代理）。
+- `/load-error` 只提供"刷新"，不会自动重试加载失败的 chunk。
+- 没有错误上报与性能埋点。
+
+### 六、未决
+
+- 业务页多起来以后是否需要 Pinia；现在只有会话一份共享状态。
+- 生产形态：Nginx 静态托管 + 反代，还是 FastAPI 直接托管 `dist/`？后者更简单，但会把前端发版绑在后端进程上。
+- 前端权限粒度：现在只有"登录/未登录"，未来如果出现多角色，守卫要重做。

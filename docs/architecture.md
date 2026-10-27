@@ -156,6 +156,21 @@ backend/
 ├── alembic.ini
 ├── tests/                    # 纯函数单测 + 合成用例回归
 └── scripts/                  # check（不调模型）/ run（真调模型）
+
+frontend/                     # 管理端（Vue 3 + Vite + TypeScript + Element Plus）
+├── src/
+│   ├── main.ts               # 装配：Element Plus + 路由 + 全局错误兜底
+│   ├── App.vue               # ErrorBoundary + router-view
+│   ├── api/client.ts         # fetch 封装：统一 ApiError / 401 / 网络错误
+│   ├── api/auth.ts           # 登录、退出、会话
+│   ├── session.ts            # 登录态：/api/auth/session 只确认一次
+│   ├── feedback.ts           # 统一错误提示（ElMessage）
+│   ├── router/index.ts       # 路由与登录守卫
+│   ├── components/           # ErrorBoundary（渲染错误兜底）
+│   ├── layouts/              # AdminLayout
+│   └── views/                # LoginView / HomeView / NotFoundView / LoadErrorView
+├── tests/                    # Vitest + jsdom
+└── vite.config.ts            # dev proxy /api → :8000；Vitest 配置
 ```
 
 **依赖方向只能自上而下，禁止反向引用：**
@@ -474,6 +489,23 @@ system 中的三条硬纪律：
 
 > 共享口令无法区分"是谁操作的"。单用户场景可以接受；一旦需要多人协作，再升级为账号体系，并补审计日志。
 
+### 5.9 管理端骨架
+
+前端只做三件事：**登录、路由、把错误说清楚**。业务页留到 #13–#15。
+
+| 决定 | 理由 | 代价 |
+| --- | --- | --- |
+| 登录态只放在内存 + 服务端 cookie | 不在 localStorage 里存 token/`authenticated` 标记；刷新时重放 `GET /api/auth/session`，以服务端为准 | 每次刷新多一次请求（可忽略） |
+| 所有非公开路由先过守卫 | 未登录访问未知路径也先去登录页，不能因为"404"就露出管理端骨架 | 404 页也要求登录 |
+| 401 立即回登录页 | `api/client` 发现 401 就清本地登录态，并调用路由层注册的导航回调；不是等"下一次导航" | 无法在页面上区分"过期"与"从没登录" |
+| 错误文案只有一个映射 | `ApiError` + `errorMessage` 统一生成可读句子；登录失败贴在表单旁，其余错误用全局提示 | 同一条错误不会两处同时出现，但需要页面自己选呈现方式 |
+| 两级渲染兜底 | `AdminLayout` 内层 `ErrorBoundary` 只替换内容区（导航还在）；`App` 外层兜住登录页等其余渲染错误 | 内层边界随路由 remount，会丢掉出错页面的本地状态 |
+| 懒加载失败有回退页 | `router.onError` + 主包里的 `/load-error`：chunk 加载失败不会只留白屏 | 回退页只提供"刷新"，不能自动重试 |
+| 开发期用 Vite 代理 `/api` | 前后端同源，cookie 与 CORS 都不用额外配置 | 生产部署必须让静态站点与 `/api` 同源（反代） |
+
+**测试边界**：Vitest 只断言"行为"——守卫去了哪个路由、请求发了什么、错误提示是不是可读；
+不断言样式与 Element Plus 内部实现。
+
 ## 6. 关键设计决策
 
 | # | 决策点 | 备选 | 选择 | 代价（必须承认） |
@@ -544,9 +576,9 @@ system 中的三条硬纪律：
 | 迁移工具 | **已定** Alembic | 表结构代码真源 `store/tables.py`，部署真源 `migrations/`，由测试强制对齐 |
 | 数据库访问 | **已定** SQLAlchemy 2.0 Core + PyMySQL | 只有 `store/` 依赖它；`core/` 与 `pipeline.py` 不碰 SQL |
 | 任务执行 | **已实现** 进程内线程池 | `GRADING_CONCURRENCY`（默认 2，上限 4）。重启时把 running 任务标为 interrupted 并可重试；多 worker 部署需换共享队列 |
-| 前端 | **已定** Vue 3 | 组件库待定；复核界面是必需项 |
+| 前端 | **已实现骨架** Vue 3 + Vite + TypeScript | Element Plus；Vitest + jsdom；业务页在 #13–#15 |
 | 认证 | **已实现** 单口令 + 会话 cookie | 口令存 `ADMIN_PASSWORD`，缺失则启动失败；会话服务端登记，退出即可撤销。会话存内存（重启失效），多进程需换共享存储 |
-| 接口层 | **已实现** FastAPI | 认证、答卷导入、批量任务、复核（队列/详情/改分/批量通过）、评分标准（生成/迭代/保存/列表/按版本打开）；前端待 #12–#15 |
+| 接口层 | **已实现** FastAPI | 认证、答卷导入、批量任务、复核（队列/详情/改分/批量通过）、评分标准（生成/迭代/保存/列表/按版本打开）；管理端骨架已就绪（#12），业务页待 #13–#15 |
 | 部署 | 待定 | 本地演示优先 |
 | 最高档分值是否必须等于权重 | 待定 | 目前只作为 `TOP_LEVEL_BELOW_WEIGHT` **提示**，不拦保存。加硬校验会让"按权重算分"名副其实，但会约束评分标准的写法 |
 
