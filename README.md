@@ -54,6 +54,7 @@ DeepJudge/
 | Web 框架 | FastAPI | **已定** |
 | 服务形态 | 单体后端 | **已定** |
 | 存储 | MySQL 8（`utf8mb4`）+ Alembic 迁移 | **已实现** |
+| 认证 | 共享口令 + 服务端会话 cookie | **已实现** |
 | 任务执行 | 进程内后台任务 / 独立 worker | 待定 |
 | 前端 | Vue 3 | **已定**（组件库待定） |
 | LLM 供应商与参数 | DeepSeek（`providers/deepseek.py`，标准库实现） | **已接入** |
@@ -92,6 +93,23 @@ cp .env.example .env          # 填 DEEPSEEK_API_KEY；DATABASE_URL 指向本地
 在 `backend/` 下跑 `alembic upgrade head`。要连数据一起重来用 `./scripts/dev-db.sh reset`。
 
 拉不动官方镜像时换镜像站：`MYSQL_IMAGE=docker.1ms.run/library/mysql:8 ./scripts/dev-db.sh up`
+
+**起 HTTP 服务**
+
+```bash
+cd backend
+ADMIN_PASSWORD=换个只有你知道的口令 python3 -m uvicorn app.main:create_app --factory --port 8000
+```
+
+没有 `ADMIN_PASSWORD` 会直接启动失败——不会静默跑起来一个谁都能进的管理端。
+目前接口只有登录、退出、会话查询与健康检查（业务接口在后续工单里）：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/auth/session        # 401
+curl -s -c /tmp/c.txt -X POST http://127.0.0.1:8000/api/auth/login \
+     -H 'content-type: application/json' -d '{"password":"换个只有你知道的口令"}'        # 204
+curl -s -b /tmp/c.txt http://127.0.0.1:8000/api/auth/session                            # 200
+```
 
 **先把教师的一段口述变成结构化标准**
 

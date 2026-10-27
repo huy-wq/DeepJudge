@@ -6,9 +6,9 @@
 >
 > 若两者冲突，以 `docs/architecture.md` 为准；发现冲突请改本文件。
 
-**当前状态**：114 个测试通过（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
-裸 `python3` 会因缺少 SQLAlchemy 跳过存储用例，数字对不上不是回归），约 7300 行（含文档与测试）。
-已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#10 标准生成。
+**当前状态**：141 个测试通过（3 个 MySQL 真库用例默认跳过；计数来自装了依赖的 `.venv`，
+裸 `python3` 会因缺少 SQLAlchemy / FastAPI 跳过存储与接口用例，数字对不上不是回归），约 8000 行（含文档与测试）。
+已完成的工单：#2 单份评分闭环、#3 证据接地、#4 多采样与路由、#5 持久化、#6 认证、#10 标准生成。
 **没有**的部分见 §8，别在代码里找不存在的东西。
 
 ---
@@ -38,10 +38,13 @@ backend/
 │   ├── pipeline.py      ← 编排：把上面两层串成"一次评分"
 │   ├── rubric_gen.py    ← 编排：把教师口述的标准变成结构化标准（三视图 + 一次重试）
 │   ├── store/           ← 持久化（唯一碰 SQL 的地方）
+│   ├── api/             ← HTTP 接口层：路由、认证依赖、请求响应模型
+│   ├── auth.py          ← 共享口令 + 服务端会话（可撤销、可过期）
+│   ├── main.py          ← FastAPI 装配（工厂函数，启动期校验口令）
 │   ├── cli.py           ← 命令行入口与报告组装
 │   └── config.py        ← .env 读取
 ├── migrations/          ← Alembic 迁移（表结构的部署真源）
-├── tests/               ← 114 个用例
+├── tests/               ← 141 个用例
 └── scripts/             ← 实验脚本（backend/scripts，如方差实测）
 
 仓库根目录还有：docker-compose.yml（本地 MySQL 8）、scripts/dev-db.sh（一键起库 + 迁移）。
@@ -59,6 +62,7 @@ backend/
 | `core/aggregate.py` + `core/routing.py` | 194 | 仅标准库 | ⑦ |
 | `store/` | 719 | SQLAlchemy | ⑧ |
 | `cli.py` | 206 | 全部 | ⑨ |
+| `auth.py` + `api/` + `main.py` | 约 330 | FastAPI | ⑩（另一条主线：HTTP 入口） |
 
 **依赖方向是硬约束，不是风格建议。** 可以用一条命令自己验：
 
@@ -619,6 +623,45 @@ s.dispose()
 **要看出什么**：CLI 里没有任何业务规则，只有"读参数 → 调用 → 打印 → 定退出码"。
 规则都在 `core/` 和 `pipeline.py` 里。
 
+### ⑩ HTTP 入口与认证：`app/main.py` + `app/auth.py` + `app/api/`（约 20 分钟）
+
+**职责**：让管理端"只有拿着口令的人能用"。这是唯一一条**不服务于评分**的线，
+但它是所有后续接口的地基。
+
+| 位置 | 在干什么 | 读的时候注意 |
+| --- | --- | --- |
+| `app/auth.py:43` `AdminAuth` | 口令校验 + 会话登记表 | 不读环境变量、不碰 HTTP，所以过期能用"拨表"测 |
+| `:72` `login` | `compare_digest` 比对，通过则生成随机 sid 并登记 | 用 `==` 会按首字节提前返回，泄漏"前几位对了" |
+| `:87` `verify` | 缺失 / 伪造 / 过期 / 已退出，一律 `AuthError` | 四种失败对外是同一句话，避免变成探测手段 |
+| `:104` `logout` | 从登记表里删掉 | **这就是"退出后原凭据立即不可用"的全部实现** |
+| `app/api/deps.py:22` `require_admin` | 受保护路由的依赖 | 读 cookie → `verify` → 失败 401。路由里不写 `if not logged_in` |
+| `app/api/routes.py:32` `register` | 登录 / 退出 / 会话 / 健康检查 | 只读写 cookie，没有判断逻辑 |
+| `app/main.py:44` `create_app` | 装配 + 启动期校验口令 | 用工厂函数：模块级 `app` 会让"没配口令"在 import 期就炸 |
+
+**这一层最该看出的一个取舍**：架构最初写的是"签名 cookie"（无状态），
+但验收要求"退出后原凭据立即不可用"——签名能证明"是我发的"，不能证明"没被撤销"。
+所以改成了**服务端登记表**。`tests/test_api_auth.py` 里那条"退出后重放旧 cookie 必须 401"
+就是钉这个差别的；把它删掉，你就退回到"客户端删了就算退出"。
+
+**动手验证**（真起服务，不依赖数据库）：
+
+```bash
+cd backend
+ADMIN_PASSWORD=devpass python3 -m uvicorn app.main:create_app --factory --port 8000 &
+# 无凭据 → 401
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/auth/session
+# 错口令 → 401，且只说"口令错误"
+curl -s -X POST http://127.0.0.1:8000/api/auth/login -H 'content-type: application/json' -d '{"password":"nope"}'
+# 正确口令 → 204 并下发 cookie
+curl -s -c /tmp/c.txt -o /dev/null -w '%{http_code}\n' \
+  -X POST http://127.0.0.1:8000/api/auth/login -H 'content-type: application/json' -d '{"password":"devpass"}'
+# 带 cookie → 200
+curl -s -b /tmp/c.txt http://127.0.0.1:8000/api/auth/session
+```
+
+**读完要能回答**：为什么 `GET /api/health` 不需要登录？
+（因为"受保护"指的是管理接口；健康检查是给部署探针用的，登录反而没法探。）
+
 ---
 
 ## 3. 三条主线追踪
@@ -686,6 +729,8 @@ python3 -m unittest discover -s tests -t .          # 默认命令（缺依赖�
 | `test_store.py` | 9 | 字段无损往返；标准快照不可变；重评后按旧运行号不会串到新结论 |
 | `test_migrations.py` | 2 | 迁移建出的表 == `tables.py`（逐列、逐索引、逐外键） |
 | `test_store_mysql.py` | 3 | 真库 `utf8mb4`；中文与 emoji 在 TEXT 与 **JSON 列**都能存活（默认跳过） |
+| `test_auth.py` | 13 | 口令校验、会话过期（拨表不 sleep）、退出即撤销、口令为空拒绝启动 |
+| `test_api_auth.py` | 14 | 401 的三种来源、登录下发 cookie、错口令不透露原因、退出后重放旧 cookie 必须 401 |
 
 **测试里的接缝（seam）**，读懂这三个就够了：
 
@@ -715,6 +760,9 @@ python3 -m app.cli \
   --answer ../data/samples/tcp-handshake/answer.txt \
   --response ../data/samples/tcp-handshake/response.json \
   --samples 3
+
+# 起 HTTP 服务（不需要数据库；没有 ADMIN_PASSWORD 会直接失败）
+cd backend && ADMIN_PASSWORD=devpass python3 -m uvicorn app.main:create_app --factory --port 8000
 
 # 从教师原话生成结构化标准（离线；加 --live 则真调模型）
 cd backend
@@ -760,7 +808,8 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 | 调聚合或路由阈值 | `core/aggregate.py` / `core/routing.py` 的 `RoutePolicy` | `store/` |
 | 加一种采分点类型 | `core/types.py` + `core/rubric.py` 的校验 + 迁移 | `cli.py` |
 | 加字段落库 | `store/tables.py` + 新迁移 + `save/load` | 其它层 |
-| 加 HTTP 接口 | 新建 `app/api/`（按架构 §3 应放这里） | `core/` |
+| 加 HTTP 接口 | `app/api/routes.py` 里加，受保护接口挂 `Depends(require_admin)` | `core/`、`auth.py` |
+| 换会话存储（Redis / 数据库） | 只换 `AdminAuth` 的登记表实现 | `api/`、`main.py` |
 
 `Store` 的公开成员只有五个：`from_url` / `engine` / `dispose` / `save_evaluation` / `load_evaluation`。
 `create_schema` 已经被拿掉了——建表只能走迁移，`tests/support.py` 里那份是测试专用。
@@ -773,8 +822,7 @@ cd backend && DATABASE_URL=... python3 -m alembic upgrade head --sql   # 只打�
 
 | 缺什么 | 属于哪张工单 | 现状 |
 | --- | --- | --- |
-| `app/main.py`、`app/api/` | #7 起 | 完全没有。现在唯一入口是 `cli.py` |
-| 认证（口令 + cookie） | #6 | 没有 |
+| 业务接口（导入/评分/复核） | #7 之后 | `app/api/` 已建，但只有登录/退出/会话/健康检查 |
 | 答卷批量导入 | #7 | 只能一次一份，用 `--answer` |
 | 后台批量评分任务 | #8 | 没有，`evaluate` 是同步的 |
 | 复核界面与人工改分 | #9 | 只有 `reviews` 表，没有读写它的代码 |
@@ -818,7 +866,8 @@ Day 2（系统与工程）
   → migrations/versions/ 初始迁移（对照 tables.py 读）
   → ⑨ cli.py
   → tests/test_store.py + test_migrations.py（看"字段无损"和"迁移对齐"是怎么被守住的）
-  → docs/ticket-notes.md（看 #4 和 #5 里那些被修掉的 bug，比读正常代码更快理解设计边界）
+  → ⑩ app/main.py → app/auth.py → app/api/deps.py → app/api/routes.py
+  → docs/ticket-notes.md（看 #4 / #5 / #6 里那些被修掉的 bug，比读正常代码更快理解设计边界）
 ```
 
 **一个提高效率的习惯**：读每一节之前，先看那一层对应的测试类名。
